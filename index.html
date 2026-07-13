@@ -1,0 +1,689 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Mernova Solutions — Founders Ledger</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: #f4f6f8; color: #1c2733; padding: 24px; font-size: 14px;
+  }
+  h1 { font-size: 20px; margin-bottom: 4px; }
+  .subtitle { color: #5a6b7b; margin-bottom: 20px; font-size: 13px; }
+
+  .toolbar { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 20px; }
+  .toolbar label { font-weight: 600; }
+  .toolbar input[type="text"] { width: 70px; padding: 6px 8px; border: 1px solid #c6d0da; border-radius: 6px; }
+
+  button {
+    padding: 8px 14px; border: 1px solid #c6d0da; border-radius: 6px; background: #fff;
+    cursor: pointer; font-size: 13px; font-weight: 600; color: #1c2733;
+  }
+  button:hover { background: #eef2f6; }
+  button.primary { background: #1a6ee0; border-color: #1a6ee0; color: #fff; }
+  button.primary:hover { background: #1559b8; }
+  button.danger-link, button.edit-link {
+    border: none; background: none; padding: 2px 6px; font-weight: 600;
+  }
+  button.edit-link { color: #1a6ee0; }
+  button.danger-link { color: #c0392b; }
+
+  /* Dashboard cards */
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 24px; }
+  .card { background: #fff; border: 1px solid #e1e7ed; border-radius: 10px; padding: 14px 16px; }
+  .card .label { font-size: 12px; color: #5a6b7b; font-weight: 600; text-transform: uppercase; letter-spacing: .03em; }
+  .card .value { font-size: 18px; font-weight: 700; margin-top: 6px; white-space: nowrap; }
+  .card .note { font-size: 11px; color: #7a8a99; margin-top: 6px; line-height: 1.35; }
+  .card.cash { border-left: 4px solid #1a6ee0; }
+  .card.vat { border-left: 4px solid #b8860b; }
+
+  /* Form */
+  .form-panel { background: #fff; border: 1px solid #e1e7ed; border-radius: 10px; padding: 18px; margin-bottom: 24px; }
+  .form-panel h2 { font-size: 15px; margin-bottom: 14px; }
+  .form-grid { display: flex; flex-wrap: wrap; gap: 14px; align-items: flex-end; }
+  .field { display: flex; flex-direction: column; gap: 4px; }
+  .field label { font-size: 12px; font-weight: 600; color: #46586a; }
+  .field input, .field select {
+    padding: 7px 9px; border: 1px solid #c6d0da; border-radius: 6px; font-size: 13px; min-width: 120px;
+  }
+  .field input.pct { min-width: 80px; width: 80px; }
+  #delivery-check { font-size: 12px; font-weight: 700; padding: 7px 0; }
+  #delivery-check.ok { color: #1e8e3e; }
+  #delivery-check.bad { color: #c0392b; }
+  #form-error { color: #c0392b; font-weight: 600; margin-top: 10px; display: none; }
+
+  /* Table */
+  .table-wrap { overflow-x: auto; background: #fff; border: 1px solid #e1e7ed; border-radius: 10px; }
+  table { border-collapse: collapse; width: 100%; min-width: 1100px; }
+  th, td { padding: 8px 10px; text-align: right; border-bottom: 1px solid #edf1f5; white-space: nowrap; }
+  th { background: #f8fafc; font-size: 11px; text-transform: uppercase; letter-spacing: .03em; color: #5a6b7b; position: sticky; top: 0; }
+  td.text, th.text { text-align: left; }
+  td .deliv-tag { display: block; font-size: 11px; color: #7a8a99; }
+  .pos { color: #1e8e3e; }
+  .neg { color: #c0392b; }
+  .type-Revenue { color: #1e8e3e; font-weight: 700; }
+  .type-Cost { color: #c0392b; font-weight: 700; }
+  .type-Withdrawal { color: #b8860b; font-weight: 700; }
+  .empty-row td { text-align: center; color: #7a8a99; padding: 24px; }
+</style>
+</head>
+<body>
+
+<h1>Mernova Solutions — Founders Ledger</h1>
+<p class="subtitle">Revenue is entered VAT-inclusive (15%). Yehia's fee is 5% of net. Distributable splits 70% company (Khaled 40 / Lotfy 30 / Tarek 30) and 30% delivery (per-project percentages).</p>
+
+<div class="toolbar">
+  <label for="currency">Currency</label>
+  <input type="text" id="currency" value="SAR">
+  <button id="btn-download">Download backup (JSON)</button>
+  <button id="btn-load">Load backup (JSON)</button>
+  <button id="btn-export">Export to Excel (.xlsx)</button>
+  <input type="file" id="file-input" accept=".json,application/json" style="display:none">
+</div>
+
+<div class="cards">
+  <div class="card"><div class="label">Khaled Rashad</div><div class="value" id="bal-khaled"></div></div>
+  <div class="card"><div class="label">Lotfy Nashaat</div><div class="value" id="bal-lotfy"></div></div>
+  <div class="card"><div class="label">Tarek A. Elgaabary</div><div class="value" id="bal-tarek"></div></div>
+  <div class="card"><div class="label">Yehia (fees)</div><div class="value" id="bal-yehia"></div></div>
+  <div class="card cash">
+    <div class="label">Company cash</div><div class="value" id="bal-cash"></div>
+    <div class="note">Net revenue in − costs − withdrawals. Cash not yet withdrawn is the company's balance.</div>
+  </div>
+  <div class="card vat">
+    <div class="label">VAT held</div><div class="value" id="bal-vat"></div>
+    <div class="note">Owed to the tax authority — not part of anyone's equity.</div>
+  </div>
+</div>
+
+<div class="form-panel">
+  <h2 id="form-title">Add transaction</h2>
+  <div class="form-grid">
+    <div class="field"><label for="f-date">Date</label><input type="date" id="f-date"></div>
+    <div class="field">
+      <label for="f-type">Type</label>
+      <select id="f-type">
+        <option value="Revenue">Revenue</option>
+        <option value="Cost">Cost</option>
+        <option value="Withdrawal">Withdrawal</option>
+      </select>
+    </div>
+
+    <div class="field" id="fw-desc"><label for="f-desc" id="f-desc-label">Project</label><input type="text" id="f-desc" placeholder="Project name"></div>
+
+    <div class="field" id="fw-person" style="display:none">
+      <label for="f-person">Person</label>
+      <select id="f-person">
+        <option value="Khaled">Khaled</option>
+        <option value="Lotfy">Lotfy</option>
+        <option value="Tarek">Tarek</option>
+        <option value="Yehia">Yehia</option>
+      </select>
+    </div>
+
+    <div class="field"><label for="f-amount" id="f-amount-label">Amount (gross, VAT-inclusive)</label><input type="number" id="f-amount" min="0" step="any" placeholder="0.00"></div>
+
+    <div class="field" id="fw-dk"><label for="f-dk">Khaled delivery %</label><input type="number" class="pct" id="f-dk" min="0" max="100" step="any" placeholder="0"></div>
+    <div class="field" id="fw-dl"><label for="f-dl">Lotfy delivery %</label><input type="number" class="pct" id="f-dl" min="0" max="100" step="any" placeholder="0"></div>
+    <div class="field" id="fw-dt"><label for="f-dt">Tarek delivery %</label><input type="number" class="pct" id="f-dt" min="0" max="100" step="any" placeholder="0"></div>
+    <div class="field" id="fw-check"><span id="delivery-check"></span></div>
+
+    <div class="field"><label for="f-notes">Notes</label><input type="text" id="f-notes" placeholder="Optional"></div>
+
+    <div class="field"><button class="primary" id="btn-save">Add transaction</button></div>
+    <div class="field"><button id="btn-cancel" style="display:none">Cancel edit</button></div>
+  </div>
+  <div id="form-error"></div>
+</div>
+
+<div class="table-wrap">
+  <table>
+    <thead>
+      <tr>
+        <th class="text">Date</th>
+        <th class="text">Type</th>
+        <th class="text">Project / Description</th>
+        <th>Amount (gross)</th>
+        <th>Net</th>
+        <th>VAT</th>
+        <th>Yehia fee Δ</th>
+        <th>Khaled Δ</th>
+        <th>Lotfy Δ</th>
+        <th>Tarek Δ</th>
+        <th class="text">Notes</th>
+        <th class="text">Actions</th>
+      </tr>
+    </thead>
+    <tbody id="tx-body"></tbody>
+  </table>
+</div>
+
+<script>
+"use strict";
+
+/* ============================================================
+   CONSTANTS — the fixed rules of the money math
+   ============================================================ */
+const VAT_RATE = 0.15;            // revenue entered gross: Net = Amount / 1.15
+const YEHIA_FEE_RATE = 0.05;      // 5% of Net
+const COMPANY_SHARE = 0.70;       // of Distributable
+const DELIVERY_SHARE = 0.30;      // of Distributable
+const COMPANY_SPLIT = { khaled: 0.40, lotfy: 0.30, tarek: 0.30 };  // fixed company split
+const COST_SPLIT    = { khaled: 0.40, lotfy: 0.30, tarek: 0.30 };  // fixed cost split
+
+/* ============================================================
+   STATE — raw inputs only; every derived number is recomputed
+   from full precision on demand (round only for display).
+   ============================================================ */
+let transactions = [];  // {id, date, type, desc, amount, delivK, delivL, delivT, person, notes}
+let nextId = 1;
+let editingId = null;
+
+/* ============================================================
+   CORE MATH — given one raw transaction, return its signed
+   ledger deltas. This is the single source of truth.
+   ============================================================ */
+function computeRow(tx) {
+  const r = { net: 0, vat: 0, yehia: 0, khaled: 0, lotfy: 0, tarek: 0, cash: 0 };
+  if (tx.type === "Revenue") {
+    r.net = tx.amount / (1 + VAT_RATE);
+    r.vat = tx.amount - r.net;
+    r.yehia = YEHIA_FEE_RATE * r.net;
+    const distributable = r.net - r.yehia;              // 0.95 × Net
+    const company = COMPANY_SHARE * distributable;      // 70%
+    const delivery = DELIVERY_SHARE * distributable;    // 30%
+    r.khaled = COMPANY_SPLIT.khaled * company + (tx.delivK / 100) * delivery;
+    r.lotfy  = COMPANY_SPLIT.lotfy  * company + (tx.delivL / 100) * delivery;
+    r.tarek  = COMPANY_SPLIT.tarek  * company + (tx.delivT / 100) * delivery;
+    r.cash = r.net;                                     // net revenue enters company cash
+  } else if (tx.type === "Cost") {
+    r.khaled = -COST_SPLIT.khaled * tx.amount;
+    r.lotfy  = -COST_SPLIT.lotfy  * tx.amount;
+    r.tarek  = -COST_SPLIT.tarek  * tx.amount;
+    r.cash = -tx.amount;
+  } else if (tx.type === "Withdrawal") {
+    if (tx.person === "Khaled") r.khaled = -tx.amount;
+    else if (tx.person === "Lotfy") r.lotfy = -tx.amount;
+    else if (tx.person === "Tarek") r.tarek = -tx.amount;
+    else if (tx.person === "Yehia") r.yehia = -tx.amount;
+    r.cash = -tx.amount;
+  }
+  return r;
+}
+
+function computeBalances() {
+  const b = { khaled: 0, lotfy: 0, tarek: 0, yehia: 0, cash: 0, vat: 0 };
+  for (const tx of transactions) {
+    const r = computeRow(tx);
+    b.khaled += r.khaled;
+    b.lotfy  += r.lotfy;
+    b.tarek  += r.tarek;
+    b.yehia  += r.yehia;
+    b.cash   += r.cash;
+    b.vat    += r.vat;
+  }
+  return b;
+}
+
+/* ============================================================
+   FORMATTING — rounding happens here and only here
+   ============================================================ */
+function fmt(x) {
+  const cur = document.getElementById("currency").value.trim() || "SAR";
+  const n = x.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  return n + " " + cur;
+}
+function fmtSigned(x) {
+  if (Math.abs(x) < 1e-9) return "—";
+  return fmt(x);
+}
+function signClass(x) {
+  if (Math.abs(x) < 1e-9) return "";
+  return x > 0 ? "pos" : "neg";
+}
+
+/* ============================================================
+   RENDERING
+   ============================================================ */
+function render() {
+  const b = computeBalances();
+  document.getElementById("bal-khaled").textContent = fmt(b.khaled);
+  document.getElementById("bal-lotfy").textContent  = fmt(b.lotfy);
+  document.getElementById("bal-tarek").textContent  = fmt(b.tarek);
+  document.getElementById("bal-yehia").textContent  = fmt(b.yehia);
+  document.getElementById("bal-cash").textContent   = fmt(b.cash);
+  document.getElementById("bal-vat").textContent    = fmt(b.vat);
+
+  const tbody = document.getElementById("tx-body");
+  tbody.innerHTML = "";
+
+  if (transactions.length === 0) {
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="12">No transactions yet.</td></tr>';
+    return;
+  }
+
+  // newest first: by date desc, then most recently added first
+  const sorted = [...transactions].sort((a, z) =>
+    z.date.localeCompare(a.date) || z.id - a.id
+  );
+
+  for (const tx of sorted) {
+    const r = computeRow(tx);
+    const tr = document.createElement("tr");
+
+    let descCell = escapeHtml(tx.desc || (tx.type === "Withdrawal" ? "Withdrawal — " + tx.person : ""));
+    if (tx.type === "Revenue") {
+      descCell += '<span class="deliv-tag">Delivery: K ' + tx.delivK + "% / L " + tx.delivL + "% / T " + tx.delivT + "%</span>";
+    }
+    if (tx.type === "Withdrawal" && tx.desc) {
+      descCell = escapeHtml("Withdrawal — " + tx.person);
+    } else if (tx.type === "Withdrawal") {
+      descCell = escapeHtml("Withdrawal — " + tx.person);
+    }
+
+    tr.innerHTML =
+      '<td class="text">' + tx.date + "</td>" +
+      '<td class="text type-' + tx.type + '">' + tx.type + "</td>" +
+      '<td class="text">' + descCell + "</td>" +
+      "<td>" + fmt(tx.amount) + "</td>" +
+      "<td>" + (tx.type === "Revenue" ? fmt(r.net) : "—") + "</td>" +
+      "<td>" + (tx.type === "Revenue" ? fmt(r.vat) : "—") + "</td>" +
+      '<td class="' + signClass(r.yehia) + '">' + fmtSigned(r.yehia) + "</td>" +
+      '<td class="' + signClass(r.khaled) + '">' + fmtSigned(r.khaled) + "</td>" +
+      '<td class="' + signClass(r.lotfy) + '">' + fmtSigned(r.lotfy) + "</td>" +
+      '<td class="' + signClass(r.tarek) + '">' + fmtSigned(r.tarek) + "</td>" +
+      '<td class="text">' + escapeHtml(tx.notes || "") + "</td>" +
+      '<td class="text">' +
+        '<button class="edit-link" data-edit="' + tx.id + '">Edit</button>' +
+        '<button class="danger-link" data-del="' + tx.id + '">Delete</button>' +
+      "</td>";
+    tbody.appendChild(tr);
+  }
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+/* ============================================================
+   FORM behaviour
+   ============================================================ */
+const el = (id) => document.getElementById(id);
+
+function updateFormFields() {
+  const type = el("f-type").value;
+  const isRev = type === "Revenue";
+  const isCost = type === "Cost";
+  const isWd = type === "Withdrawal";
+
+  el("fw-desc").style.display = isWd ? "none" : "";
+  el("f-desc-label").textContent = isRev ? "Project" : "Description";
+  el("f-desc").placeholder = isRev ? "Project name" : "Expense description";
+  el("f-amount-label").textContent = isRev ? "Amount (gross, VAT-inclusive)" : "Amount";
+  el("fw-person").style.display = isWd ? "" : "none";
+  for (const id of ["fw-dk", "fw-dl", "fw-dt", "fw-check"]) {
+    el(id).style.display = isRev ? "" : "none";
+  }
+  updateDeliveryCheck();
+}
+
+function updateDeliveryCheck() {
+  if (el("f-type").value !== "Revenue") return;
+  const sum = (parseFloat(el("f-dk").value) || 0) +
+              (parseFloat(el("f-dl").value) || 0) +
+              (parseFloat(el("f-dt").value) || 0);
+  const span = el("delivery-check");
+  const ok = Math.abs(sum - 100) < 1e-9;
+  span.textContent = ok ? "Delivery total: 100% ✓" : "Delivery total: " + sum + "% — must total 100%";
+  span.className = ok ? "ok" : "bad";
+}
+
+function showError(msg) {
+  const e = el("form-error");
+  e.textContent = msg;
+  e.style.display = msg ? "block" : "none";
+}
+
+function resetForm() {
+  editingId = null;
+  el("f-date").value = new Date().toISOString().slice(0, 10);
+  el("f-desc").value = "";
+  el("f-amount").value = "";
+  el("f-dk").value = "";
+  el("f-dl").value = "";
+  el("f-dt").value = "";
+  el("f-notes").value = "";
+  el("form-title").textContent = "Add transaction";
+  el("btn-save").textContent = "Add transaction";
+  el("btn-cancel").style.display = "none";
+  showError("");
+  updateDeliveryCheck();
+}
+
+function saveTransaction() {
+  showError("");
+  const type = el("f-type").value;
+  const date = el("f-date").value;
+  const amount = parseFloat(el("f-amount").value);
+
+  if (!date) return showError("Date is required.");
+  if (!(amount > 0)) return showError("Amount must be a positive number.");
+
+  const tx = {
+    id: editingId ?? nextId++,
+    date, type,
+    desc: el("f-desc").value.trim(),
+    amount,
+    delivK: null, delivL: null, delivT: null,
+    person: null,
+    notes: el("f-notes").value.trim(),
+  };
+
+  if (type === "Revenue") {
+    const dk = parseFloat(el("f-dk").value);
+    const dl = parseFloat(el("f-dl").value);
+    const dt = parseFloat(el("f-dt").value);
+    if ([dk, dl, dt].some((v) => isNaN(v) || v < 0)) {
+      return showError("Enter all three delivery percentages (0 or more).");
+    }
+    if (Math.abs(dk + dl + dt - 100) >= 1e-9) {
+      return showError("Delivery percentages must total exactly 100%.");
+    }
+    tx.delivK = dk; tx.delivL = dl; tx.delivT = dt;
+  } else if (type === "Withdrawal") {
+    tx.person = el("f-person").value;
+  }
+
+  if (editingId !== null) {
+    const i = transactions.findIndex((t) => t.id === editingId);
+    if (i !== -1) transactions[i] = tx;
+  } else {
+    transactions.push(tx);
+  }
+  resetForm();
+  render();
+}
+
+function startEdit(id) {
+  const tx = transactions.find((t) => t.id === id);
+  if (!tx) return;
+  editingId = id;
+  el("f-type").value = tx.type;
+  updateFormFields();
+  el("f-date").value = tx.date;
+  el("f-desc").value = tx.desc || "";
+  el("f-amount").value = tx.amount;
+  el("f-notes").value = tx.notes || "";
+  if (tx.type === "Revenue") {
+    el("f-dk").value = tx.delivK;
+    el("f-dl").value = tx.delivL;
+    el("f-dt").value = tx.delivT;
+  }
+  if (tx.type === "Withdrawal") el("f-person").value = tx.person;
+  el("form-title").textContent = "Edit transaction";
+  el("btn-save").textContent = "Save changes";
+  el("btn-cancel").style.display = "";
+  updateDeliveryCheck();
+  window.scrollTo({ top: 0, behavior: "smooth" });
+}
+
+function deleteTransaction(id) {
+  const tx = transactions.find((t) => t.id === id);
+  if (!tx) return;
+  if (!confirm("Delete this " + tx.type.toLowerCase() + " of " + fmt(tx.amount) + "? Balances will be recomputed.")) return;
+  transactions = transactions.filter((t) => t.id !== id);
+  if (editingId === id) resetForm();
+  render();
+}
+
+/* ============================================================
+   BACKUP — download / load JSON
+   ============================================================ */
+function downloadBackup() {
+  const payload = {
+    app: "mernova-founders-ledger",
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    currency: el("currency").value.trim() || "SAR",
+    transactions,
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "mernova-ledger-backup-" + new Date().toISOString().slice(0, 10) + ".json";
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+function loadBackup(file) {
+  const reader = new FileReader();
+  reader.onload = () => {
+    try {
+      const data = JSON.parse(reader.result);
+      if (!data || !Array.isArray(data.transactions)) throw new Error("bad shape");
+      for (const t of data.transactions) {
+        if (!t.date || !["Revenue", "Cost", "Withdrawal"].includes(t.type) || !(t.amount > 0)) {
+          throw new Error("bad transaction row");
+        }
+      }
+      transactions = data.transactions;
+      nextId = transactions.reduce((m, t) => Math.max(m, t.id || 0), 0) + 1;
+      if (data.currency) el("currency").value = data.currency;
+      resetForm();
+      render();
+    } catch (err) {
+      alert("Could not load backup: not a valid Mernova ledger JSON file.");
+    }
+  };
+  reader.readAsText(file);
+}
+
+/* ============================================================
+   EXPORT TO EXCEL — SheetJS from CDN when online, CSV fallback
+   when offline. Numbers are written at full precision; Excel
+   handles display rounding, same rule as the app.
+   ============================================================ */
+function buildExportData() {
+  const cur = el("currency").value.trim() || "SAR";
+  const b = computeBalances();
+
+  const sorted = [...transactions].sort((a, z) =>
+    z.date.localeCompare(a.date) || z.id - a.id
+  );
+
+  const txRows = [
+    ["Date", "Type", "Project/Description", "Amount (gross)", "Net", "VAT",
+     "Yehia fee Δ", "Khaled Δ", "Lotfy Δ", "Tarek Δ",
+     "Delivery K %", "Delivery L %", "Delivery T %", "Person", "Notes"],
+  ];
+  const totals = { gross: 0, net: 0, fees: 0, costs: 0, withdrawals: 0 };
+  for (const tx of sorted) {
+    const r = computeRow(tx);
+    const isRev = tx.type === "Revenue";
+    if (isRev) { totals.gross += tx.amount; totals.net += r.net; totals.fees += r.yehia; }
+    if (tx.type === "Cost") totals.costs += tx.amount;
+    if (tx.type === "Withdrawal") totals.withdrawals += tx.amount;
+    txRows.push([
+      tx.date, tx.type,
+      tx.type === "Withdrawal" ? "Withdrawal — " + tx.person : (tx.desc || ""),
+      tx.amount,
+      isRev ? r.net : "", isRev ? r.vat : "",
+      r.yehia || "", r.khaled || "", r.lotfy || "", r.tarek || "",
+      isRev ? tx.delivK : "", isRev ? tx.delivL : "", isRev ? tx.delivT : "",
+      tx.type === "Withdrawal" ? tx.person : "",
+      tx.notes || "",
+    ]);
+  }
+
+  const balRows = [
+    ["Account", "Balance (" + cur + ")"],
+    ["Khaled Rashad", b.khaled],
+    ["Lotfy Nashaat", b.lotfy],
+    ["Tarek A. Elgaabary", b.tarek],
+    ["Yehia (fees)", b.yehia],
+    ["Company cash (net revenue − costs − withdrawals)", b.cash],
+    ["VAT held (owed to tax authority)", b.vat],
+  ];
+
+  const sumPeople = b.khaled + b.lotfy + b.tarek + b.yehia;
+  const dashRows = [
+    ["Mernova Solutions — Founders Ledger"],
+    ["Exported", new Date().toISOString()],
+    ["Currency", cur],
+    ["Transactions", transactions.length],
+    [],
+    ["Totals"],
+    ["Gross revenue (VAT-inclusive)", totals.gross],
+    ["Net revenue", totals.net],
+    ["VAT collected", b.vat],
+    ["Yehia fees accrued from revenue", totals.fees],
+    ["Costs paid", totals.costs],
+    ["Withdrawals", totals.withdrawals],
+    [],
+    ["Balances"],
+    ...balRows.slice(1),
+    [],
+    ["Reconciliation check"],
+    ["Sum of personal balances", sumPeople],
+    ["Company cash", b.cash],
+    ["Difference (must be 0)", sumPeople - b.cash],
+  ];
+
+  return { txRows, balRows, dashRows };
+}
+
+function ensureXLSX() {
+  if (window.XLSX) return Promise.resolve(window.XLSX);
+  if (navigator.onLine === false) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(null), 8000);
+    const s = document.createElement("script");
+    s.src = "https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js";
+    s.onload = () => { clearTimeout(timer); resolve(window.XLSX || null); };
+    s.onerror = () => { clearTimeout(timer); resolve(null); };
+    document.head.appendChild(s);
+  });
+}
+
+function downloadBlob(filename, blob) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+function csvCell(v) {
+  const s = String(v ?? "");
+  return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+}
+
+function toCsvSection(title, rows) {
+  return "=== " + title + " ===\n" +
+    rows.map((row) => row.map(csvCell).join(",")).join("\n");
+}
+
+function exportExcel() {
+  const btn = el("btn-export");
+  btn.disabled = true;
+  const stamp = new Date().toISOString().slice(0, 10);
+  ensureXLSX().then((XLSX) => {
+    try {
+      const { txRows, balRows, dashRows } = buildExportData();
+      if (XLSX) {
+        const wb = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(txRows), "Transactions");
+        XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(balRows), "Balances");
+        XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(dashRows), "Dashboard");
+        XLSX.writeFile(wb, "mernova-ledger-" + stamp + ".xlsx");
+      } else {
+        // Offline fallback: one CSV file with the three sheets as sections
+        const BOM = String.fromCharCode(0xFEFF); // so Excel opens the CSV as UTF-8
+        const csv = BOM + [
+          toCsvSection("Transactions", txRows),
+          toCsvSection("Balances", balRows),
+          toCsvSection("Dashboard", dashRows),
+        ].join("\n\n");
+        downloadBlob("mernova-ledger-" + stamp + ".csv",
+          new Blob([csv], { type: "text/csv;charset=utf-8" }));
+        alert("No internet connection — exported as CSV instead of .xlsx. Connect once and export again for a real Excel workbook.");
+      }
+    } finally {
+      btn.disabled = false;
+    }
+  });
+}
+
+/* ============================================================
+   WIRING
+   ============================================================ */
+el("btn-export").addEventListener("click", exportExcel);
+el("f-type").addEventListener("change", updateFormFields);
+for (const id of ["f-dk", "f-dl", "f-dt"]) el(id).addEventListener("input", updateDeliveryCheck);
+el("btn-save").addEventListener("click", saveTransaction);
+el("btn-cancel").addEventListener("click", () => { resetForm(); });
+el("currency").addEventListener("input", render);
+el("btn-download").addEventListener("click", downloadBackup);
+el("btn-load").addEventListener("click", () => el("file-input").click());
+el("file-input").addEventListener("change", (e) => {
+  if (e.target.files[0]) loadBackup(e.target.files[0]);
+  e.target.value = "";
+});
+document.getElementById("tx-body").addEventListener("click", (e) => {
+  const editId = e.target.getAttribute("data-edit");
+  const delId = e.target.getAttribute("data-del");
+  if (editId) startEdit(Number(editId));
+  if (delId) deleteTransaction(Number(delId));
+});
+
+resetForm();
+updateFormFields();
+render();
+</script>
+
+<!-- ============================================================
+WORKED EXAMPLES — hand-checkable proof that the splits reconcile.
+These use the exact formulas in computeRow() above.
+
+EXAMPLE 1 — Revenue of 11,500 gross, delivery split 50/25/25
+  Net           = 11,500 / 1.15                 = 10,000.00
+  VAT           = 11,500 − 10,000               =  1,500.00   (held for tax authority)
+  Yehia fee     = 5% × 10,000                   =    500.00
+  Distributable = 10,000 − 500                  =  9,500.00
+  Company share = 70% × 9,500                   =  6,650.00
+      Khaled 40%  = 2,660.00
+      Lotfy  30%  = 1,995.00
+      Tarek  30%  = 1,995.00
+  Delivery share = 30% × 9,500                  =  2,850.00
+      Khaled 50%  = 1,425.00
+      Lotfy  25%  =   712.50
+      Tarek  25%  =   712.50
+  Row credits:
+      Khaled Δ = 2,660.00 + 1,425.00 = 4,085.00
+      Lotfy  Δ = 1,995.00 +   712.50 = 2,707.50
+      Tarek  Δ = 1,995.00 +   712.50 = 2,707.50
+      Yehia  Δ =                        500.00
+  RECONCILIATION: 4,085.00 + 2,707.50 + 2,707.50 + 500.00 = 10,000.00 = Net ✓
+  Company cash +10,000.00; VAT held +1,500.00. (10,000 + 1,500 = 11,500 gross ✓)
+
+EXAMPLE 2 — Cost of 1,000
+      Khaled Δ = −40% × 1,000 = −400.00
+      Lotfy  Δ = −30% × 1,000 = −300.00
+      Tarek  Δ = −30% × 1,000 = −300.00
+  RECONCILIATION: −400 − 300 − 300 = −1,000.00 = −cost ✓
+  Company cash −1,000.00.
+
+COMBINED (both entries in the ledger):
+      Khaled  = 4,085.00 − 400.00 = 3,685.00
+      Lotfy   = 2,707.50 − 300.00 = 2,407.50
+      Tarek   = 2,707.50 − 300.00 = 2,407.50
+      Yehia   =                       500.00
+      Cash    = 10,000 − 1,000    = 9,000.00
+      VAT     =                     1,500.00
+  RECONCILIATION: 3,685.00 + 2,407.50 + 2,407.50 + 500.00 = 9,000.00 = cash ✓
+  (Everyone's undrawn balance is exactly the cash sitting in the company.)
+============================================================ -->
+</body>
+</html>
