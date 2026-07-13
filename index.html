@@ -118,7 +118,7 @@
   <div class="card"><div class="label">Yehia</div><div class="value" id="bal-yehia"></div></div>
   <div class="card cash">
     <div class="label">Company cash</div><div class="value" id="bal-cash"></div>
-    <div class="note">Net revenue in − costs − payroll − withdrawals. Cash not yet withdrawn is the company's balance.</div>
+    <div class="note">Net revenue in − costs − withdrawals. Payroll accrues to the payee's balance and reduces cash only when withdrawn.</div>
   </div>
   <div class="card vat">
     <div class="label">VAT held</div><div class="value" id="bal-vat"></div>
@@ -279,16 +279,31 @@ function computeRow(tx) {
     r.lotfy  = COMPANY_SPLIT.lotfy  * company + fL * delivery;
     r.tarek  = COMPANY_SPLIT.tarek  * company + fT * delivery;
     r.cash = r.net;                                     // net revenue enters company cash
-  } else if (tx.type === "Cost" || tx.type === "Payroll") {
-    // company expense (payroll = salary expense with a payee), borne by the
-    // shareholders per the per-transaction split, default 30/30/30/10.
-    // Payroll does NOT credit/debit the payee's equity — it is compensation.
+  } else if (tx.type === "Cost") {
+    // company expense, borne by the shareholders per the per-transaction
+    // split, default 30/30/30/10.
     const c = costShares(tx);
     r.khaled = -(c.ck / 100) * tx.amount;
     r.lotfy  = -(c.cl / 100) * tx.amount;
     r.tarek  = -(c.ct / 100) * tx.amount;
     r.yehia  = -(c.cy / 100) * tx.amount;
     r.cash = -tx.amount;
+  } else if (tx.type === "Payroll") {
+    // salary ACCRUAL: the expense is borne by the shareholders per the split
+    // AND the full salary is credited to the payee's balance (owed to them).
+    // Company cash is untouched — it drops only when the payee takes the
+    // money as a Withdrawal. Net people-delta is 0, so balances still
+    // reconcile with cash.
+    const c = costShares(tx);
+    r.khaled = -(c.ck / 100) * tx.amount;
+    r.lotfy  = -(c.cl / 100) * tx.amount;
+    r.tarek  = -(c.ct / 100) * tx.amount;
+    r.yehia  = -(c.cy / 100) * tx.amount;
+    if (tx.person === "Khaled") r.khaled += tx.amount;
+    else if (tx.person === "Lotfy") r.lotfy += tx.amount;
+    else if (tx.person === "Tarek") r.tarek += tx.amount;
+    else if (tx.person === "Yehia") r.yehia += tx.amount;
+    r.cash = 0;
   } else if (tx.type === "Withdrawal") {
     if (tx.person === "Khaled") r.khaled = -tx.amount;
     else if (tx.person === "Lotfy") r.lotfy = -tx.amount;
@@ -340,7 +355,7 @@ function splitDetails(tx) {
   }
   if (tx.type === "Payroll") {
     const c = costShares(tx);
-    return "Payroll to " + tx.person + " — borne: K " + c.ck + "% / L " + c.cl + "% / T " + c.ct + "% / Y " + c.cy + "%";
+    return "Payroll to " + tx.person + " (accrued to balance) — borne: K " + c.ck + "% / L " + c.cl + "% / T " + c.ct + "% / Y " + c.cy + "%";
   }
   return "";
 }
@@ -864,7 +879,7 @@ function buildExportData() {
     ["Lotfy Nashaat", b.lotfy, "Founder — sum of his Δ column"],
     ["Tarek A. Elgaabary", b.tarek, "Founder — sum of his Δ column"],
     ["Yehia", b.yehia, "Shareholder (10% of Mernova share) — sum of his Δ column"],
-    ["Company cash", b.cash, "Net revenue − costs − payroll − withdrawals. Cash not yet withdrawn is the company's balance."],
+    ["Company cash", b.cash, "Net revenue − costs − withdrawals. Payroll accrues to the payee's balance and reduces cash only when withdrawn."],
     ["VAT held", b.vat, "Owed to the tax authority — not part of anyone's equity."],
   ];
 
@@ -882,7 +897,7 @@ function buildExportData() {
     ["VAT collected", b.vat],
     ["Yehia revenue share", totals.fees],
     ["Costs paid", totals.costs],
-    ["Payroll paid", totals.payroll],
+    ["Payroll accrued (credited to payees, withdrawn later)", totals.payroll],
     ["Withdrawals", totals.withdrawals],
     [],
     ["Balances"],
@@ -1171,13 +1186,18 @@ EXAMPLE 1 — Revenue of 11,500 gross, delivery split 50/25/25, Mernova share 70
   RECONCILIATION: 3,600.00 + 2,850.00 + 2,850.00 + 700.00 = 10,000.00 = Net ✓
   Company cash +10,000.00; VAT held +1,500.00. (10,000 + 1,500 = 11,500 gross ✓)
 
-PAYROLL: a salary payment (e.g. Yehia's fixed monthly payroll) is a company
-EXPENSE with a payee — identical math to a Cost: cash −amount, borne by the
-shareholders per the split (default 30/30/30/10, so the payee also bears
-their own shareholder portion). It does NOT touch the payee's equity
-balance — unlike a Withdrawal, which debits only that person. E.g. a
-5,000 payroll to Yehia: cash −5,000; K −1,500 / L −1,500 / T −1,500 /
-Y −500; Yehia personally receives the 5,000 outside the equity ledger.
+PAYROLL (accrual): a salary (e.g. Yehia's fixed monthly payroll) is a
+company expense with a payee. The expense is borne by the shareholders per
+the split (default 30/30/30/10 — the payee also bears their own
+shareholder portion) AND the full salary is CREDITED to the payee's
+balance, i.e. the company owes it to them. Company cash is untouched at
+payroll time; it drops only when the payee takes the money as a
+Withdrawal. E.g. a 5,000 payroll to Yehia:
+      Khaled Δ = −1,500 | Lotfy Δ = −1,500 | Tarek Δ = −1,500
+      Yehia  Δ = −500 (his 10% share) + 5,000 (salary) = +4,500
+      Cash: unchanged. Net people-delta = 0, so balances still = cash ✓
+When Yehia later withdraws the 5,000: Yehia Δ −5,000, cash −5,000 —
+the log shows he earned the salary and exactly when it left the company.
 
 EXAMPLE 2 — Cost of 1,000, split 30/30/30/10 (the default; editable per cost transaction)
       Khaled Δ = −30% × 1,000 = −300.00
