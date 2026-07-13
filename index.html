@@ -72,6 +72,7 @@
   .type-Revenue { color: #1e8e3e; font-weight: 700; }
   .type-Cost { color: #c0392b; font-weight: 700; }
   .type-Withdrawal { color: #b8860b; font-weight: 700; }
+  .type-Payroll { color: #7b1fa2; font-weight: 700; }
   .empty-row td { text-align: center; color: #7a8a99; padding: 24px; }
 
   /* Mobile */
@@ -117,7 +118,7 @@
   <div class="card"><div class="label">Yehia</div><div class="value" id="bal-yehia"></div></div>
   <div class="card cash">
     <div class="label">Company cash</div><div class="value" id="bal-cash"></div>
-    <div class="note">Net revenue in − costs − withdrawals. Cash not yet withdrawn is the company's balance.</div>
+    <div class="note">Net revenue in − costs − payroll − withdrawals. Cash not yet withdrawn is the company's balance.</div>
   </div>
   <div class="card vat">
     <div class="label">VAT held</div><div class="value" id="bal-vat"></div>
@@ -134,6 +135,7 @@
       <select id="f-type">
         <option value="Revenue">Revenue</option>
         <option value="Cost">Cost</option>
+        <option value="Payroll">Payroll</option>
         <option value="Withdrawal">Withdrawal</option>
       </select>
     </div>
@@ -277,8 +279,10 @@ function computeRow(tx) {
     r.lotfy  = COMPANY_SPLIT.lotfy  * company + fL * delivery;
     r.tarek  = COMPANY_SPLIT.tarek  * company + fT * delivery;
     r.cash = r.net;                                     // net revenue enters company cash
-  } else if (tx.type === "Cost") {
-    // per-transaction cost split, default 30/30/30/10 (Yehia is a shareholder)
+  } else if (tx.type === "Cost" || tx.type === "Payroll") {
+    // company expense (payroll = salary expense with a payee), borne by the
+    // shareholders per the per-transaction split, default 30/30/30/10.
+    // Payroll does NOT credit/debit the payee's equity — it is compensation.
     const c = costShares(tx);
     r.khaled = -(c.ck / 100) * tx.amount;
     r.lotfy  = -(c.cl / 100) * tx.amount;
@@ -333,6 +337,10 @@ function splitDetails(tx) {
   if (tx.type === "Cost") {
     const c = costShares(tx);
     return "Cost split: K " + c.ck + "% / L " + c.cl + "% / T " + c.ct + "% / Y " + c.cy + "%";
+  }
+  if (tx.type === "Payroll") {
+    const c = costShares(tx);
+    return "Payroll to " + tx.person + " — borne: K " + c.ck + "% / L " + c.cl + "% / T " + c.ct + "% / Y " + c.cy + "%";
   }
   return "";
 }
@@ -457,14 +465,12 @@ function render() {
     const r = computeRow(tx);
     const tr = document.createElement("tr");
 
-    let descCell = escapeHtml(tx.desc || (tx.type === "Withdrawal" ? "Withdrawal — " + tx.person : ""));
+    let descCell = escapeHtml(
+      tx.type === "Withdrawal" ? "Withdrawal — " + tx.person
+      : tx.type === "Payroll" ? "Payroll — " + tx.person + (tx.desc ? " — " + tx.desc : "")
+      : (tx.desc || ""));
     const details = splitDetails(tx);
     if (details) descCell += '<span class="deliv-tag">' + escapeHtml(details) + "</span>";
-    if (tx.type === "Withdrawal" && tx.desc) {
-      descCell = escapeHtml("Withdrawal — " + tx.person);
-    } else if (tx.type === "Withdrawal") {
-      descCell = escapeHtml("Withdrawal — " + tx.person);
-    }
 
     tr.innerHTML =
       '<td class="text">' + tx.date + "</td>" +
@@ -503,13 +509,14 @@ function updateFormFields() {
   const type = el("f-type").value;
   const isRev = type === "Revenue";
   const isCost = type === "Cost";
+  const isPay = type === "Payroll";
   const isWd = type === "Withdrawal";
 
   el("fw-desc").style.display = isWd ? "none" : "";
   el("f-desc-label").textContent = isRev ? "Project" : "Description";
-  el("f-desc").placeholder = isRev ? "Project name" : "Expense description";
+  el("f-desc").placeholder = isRev ? "Project name" : isPay ? "e.g. July salary (optional)" : "Expense description";
   el("f-amount-label").textContent = (isRev ? "Amount (gross, VAT-inclusive)" : "Amount") + " — " + el("f-cur").value;
-  el("fw-person").style.display = isWd ? "" : "none";
+  el("fw-person").style.display = (isWd || isPay) ? "" : "none";
   for (const id of ["fw-cs", "fw-cs-hint", "fw-deq"]) {
     el(id).style.display = isRev ? "" : "none";
   }
@@ -518,7 +525,7 @@ function updateFormFields() {
     el(id).style.display = showPcts ? "" : "none";
   }
   for (const id of ["fw-ck", "fw-cl", "fw-ct", "fw-cy", "fw-ccheck"]) {
-    el(id).style.display = isCost ? "" : "none";
+    el(id).style.display = (isCost || isPay) ? "" : "none";
   }
   updateDeliveryCheck();
   updateCostCheck();
@@ -526,14 +533,15 @@ function updateFormFields() {
 }
 
 function updateCostCheck() {
-  if (el("f-type").value !== "Cost") return;
+  const type = el("f-type").value;
+  if (type !== "Cost" && type !== "Payroll") return;
   const sum = (parseFloat(el("f-ck").value) || 0) +
               (parseFloat(el("f-cl").value) || 0) +
               (parseFloat(el("f-ct").value) || 0) +
               (parseFloat(el("f-cy").value) || 0);
   const span = el("cost-check");
   const ok = Math.abs(sum - 100) < 1e-9;
-  span.textContent = ok ? "Cost split total: 100% ✓" : "Cost split total: " + sum + "% — must total 100%";
+  span.textContent = ok ? "Split total: 100% ✓" : "Split total: " + sum + "% — must total 100%";
   span.className = ok ? "ok" : "bad";
 }
 
@@ -662,18 +670,19 @@ function saveTransaction() {
       tx.delivMode = mode;
       tx.delivK = dk; tx.delivL = dl; tx.delivT = dt;
     }
-  } else if (type === "Cost") {
+  } else if (type === "Cost" || type === "Payroll") {
     const ck = parseFloat(el("f-ck").value);
     const cl = parseFloat(el("f-cl").value);
     const ct = parseFloat(el("f-ct").value);
     const cy = parseFloat(el("f-cy").value);
     if ([ck, cl, ct, cy].some((v) => isNaN(v) || v < 0)) {
-      return showError("Enter all four cost split percentages (0 or more).");
+      return showError("Enter all four split percentages (0 or more).");
     }
     if (Math.abs(ck + cl + ct + cy - 100) >= 1e-9) {
-      return showError("Cost split percentages must total exactly 100%.");
+      return showError("Split percentages must total exactly 100%.");
     }
     tx.costK = ck; tx.costL = cl; tx.costT = ct; tx.costY = cy;
+    if (type === "Payroll") tx.person = el("f-person").value;  // payee
   } else if (type === "Withdrawal") {
     tx.person = el("f-person").value;
   }
@@ -712,14 +721,14 @@ function startEdit(id) {
     el("f-dt").value = tx.delivEqual ? "" : tx.delivT;
     updateFormFields();
   }
-  if (tx.type === "Cost") {
+  if (tx.type === "Cost" || tx.type === "Payroll") {
     const c = costShares(tx);
     el("f-ck").value = c.ck;
     el("f-cl").value = c.cl;
     el("f-ct").value = c.ct;
     el("f-cy").value = c.cy;
   }
-  if (tx.type === "Withdrawal") el("f-person").value = tx.person;
+  if (tx.type === "Withdrawal" || tx.type === "Payroll") el("f-person").value = tx.person;
   el("form-title").textContent = "Edit transaction";
   el("btn-save").textContent = "Save changes";
   el("btn-cancel").style.display = "";
@@ -763,7 +772,7 @@ function loadBackup(file) {
       const data = JSON.parse(reader.result);
       if (!data || !Array.isArray(data.transactions)) throw new Error("bad shape");
       for (const t of data.transactions) {
-        if (!t.date || !["Revenue", "Cost", "Withdrawal"].includes(t.type) || !(t.amount > 0)) {
+        if (!t.date || !["Revenue", "Cost", "Payroll", "Withdrawal"].includes(t.type) || !(t.amount > 0)) {
           throw new Error("bad transaction row");
         }
       }
@@ -806,17 +815,20 @@ function buildExportData() {
      "Entered amount", "Entered currency", "Rate → SAR", "Person", "Notes"],
   ];
   const rowTypes = [];  // aligned with txRows data rows; drives per-row styling
-  const totals = { gross: 0, net: 0, fees: 0, costs: 0, withdrawals: 0 };
+  const totals = { gross: 0, net: 0, fees: 0, costs: 0, payroll: 0, withdrawals: 0 };
   for (const tx of sorted) {
     const r = computeRow(tx);
     const isRev = tx.type === "Revenue";
     if (isRev) { totals.gross += tx.amount; totals.net += r.net; totals.fees += r.yehia; }
     if (tx.type === "Cost") totals.costs += tx.amount;
+    if (tx.type === "Payroll") totals.payroll += tx.amount;
     if (tx.type === "Withdrawal") totals.withdrawals += tx.amount;
     rowTypes.push(tx.type);
     txRows.push([
       tx.date, tx.type,
-      tx.type === "Withdrawal" ? "Withdrawal — " + tx.person : (tx.desc || ""),
+      tx.type === "Withdrawal" ? "Withdrawal — " + tx.person
+        : tx.type === "Payroll" ? "Payroll — " + tx.person + (tx.desc ? " — " + tx.desc : "")
+        : (tx.desc || ""),
       splitDetails(tx),
       tx.amount,
       isRev ? r.net : "", isRev ? r.vat : "",
@@ -828,14 +840,14 @@ function buildExportData() {
       isRev ? (tx.delivEqual ? 100 / 3 : normDeliv(tx, tx.delivK)) : "",
       isRev ? (tx.delivEqual ? 100 / 3 : normDeliv(tx, tx.delivL)) : "",
       isRev ? (tx.delivEqual ? 100 / 3 : normDeliv(tx, tx.delivT)) : "",
-      tx.type === "Cost" ? costShares(tx).ck : "",
-      tx.type === "Cost" ? costShares(tx).cl : "",
-      tx.type === "Cost" ? costShares(tx).ct : "",
-      tx.type === "Cost" ? costShares(tx).cy : "",
+      tx.type === "Cost" || tx.type === "Payroll" ? costShares(tx).ck : "",
+      tx.type === "Cost" || tx.type === "Payroll" ? costShares(tx).cl : "",
+      tx.type === "Cost" || tx.type === "Payroll" ? costShares(tx).ct : "",
+      tx.type === "Cost" || tx.type === "Payroll" ? costShares(tx).cy : "",
       tx.cur && tx.cur !== "SAR" ? tx.curAmount : "",
       tx.cur && tx.cur !== "SAR" ? tx.cur : "",
       tx.cur && tx.cur !== "SAR" ? tx.curRate : "",
-      tx.type === "Withdrawal" ? tx.person : "",
+      tx.type === "Withdrawal" || tx.type === "Payroll" ? tx.person : "",
       tx.notes || "",
     ]);
   }
@@ -852,7 +864,7 @@ function buildExportData() {
     ["Lotfy Nashaat", b.lotfy, "Founder — sum of his Δ column"],
     ["Tarek A. Elgaabary", b.tarek, "Founder — sum of his Δ column"],
     ["Yehia", b.yehia, "Shareholder (10% of Mernova share) — sum of his Δ column"],
-    ["Company cash", b.cash, "Net revenue − costs − withdrawals. Cash not yet withdrawn is the company's balance."],
+    ["Company cash", b.cash, "Net revenue − costs − payroll − withdrawals. Cash not yet withdrawn is the company's balance."],
     ["VAT held", b.vat, "Owed to the tax authority — not part of anyone's equity."],
   ];
 
@@ -870,6 +882,7 @@ function buildExportData() {
     ["VAT collected", b.vat],
     ["Yehia revenue share", totals.fees],
     ["Costs paid", totals.costs],
+    ["Payroll paid", totals.payroll],
     ["Withdrawals", totals.withdrawals],
     [],
     ["Balances"],
@@ -930,7 +943,7 @@ function makeStyles(cur) {
       border: { top: thin, bottom: thin, left: thin, right: thin } },
     section: { font: { sz: 10, bold: true, color: { rgb: "FFFFFF" } },
       fill: { patternType: "solid", fgColor: { rgb: "5A7A9B" } } },
-    typeColor: { Revenue: "1E8E3E", Cost: "C0392B", Withdrawal: "B8860B" },
+    typeColor: { Revenue: "1E8E3E", Cost: "C0392B", Withdrawal: "B8860B", Payroll: "7B1FA2" },
     zebra: "F2F6FA", totalsFill: "DCE6F1", cashFill: "DDEBF7",
     vatFill: "FFF2CC", okFill: "E2EFDA", badFill: "FCE4E0",
   };
@@ -1157,6 +1170,14 @@ EXAMPLE 1 — Revenue of 11,500 gross, delivery split 50/25/25, Mernova share 70
       Yehia  Δ =                         700.00
   RECONCILIATION: 3,600.00 + 2,850.00 + 2,850.00 + 700.00 = 10,000.00 = Net ✓
   Company cash +10,000.00; VAT held +1,500.00. (10,000 + 1,500 = 11,500 gross ✓)
+
+PAYROLL: a salary payment (e.g. Yehia's fixed monthly payroll) is a company
+EXPENSE with a payee — identical math to a Cost: cash −amount, borne by the
+shareholders per the split (default 30/30/30/10, so the payee also bears
+their own shareholder portion). It does NOT touch the payee's equity
+balance — unlike a Withdrawal, which debits only that person. E.g. a
+5,000 payroll to Yehia: cash −5,000; K −1,500 / L −1,500 / T −1,500 /
+Y −500; Yehia personally receives the 5,000 outside the equity ledger.
 
 EXAMPLE 2 — Cost of 1,000, split 30/30/30/10 (the default; editable per cost transaction)
       Khaled Δ = −30% × 1,000 = −300.00
