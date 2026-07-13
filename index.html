@@ -49,9 +49,12 @@
     padding: 7px 9px; border: 1px solid #c6d0da; border-radius: 6px; font-size: 13px; min-width: 120px;
   }
   .field input.pct { min-width: 80px; width: 80px; }
-  #delivery-check { font-size: 12px; font-weight: 700; padding: 7px 0; }
-  #delivery-check.ok { color: #1e8e3e; }
-  #delivery-check.bad { color: #c0392b; }
+  #delivery-check, #cost-check { font-size: 12px; font-weight: 700; padding: 7px 0; }
+  #delivery-check.ok, #cost-check.ok { color: #1e8e3e; }
+  #delivery-check.bad, #cost-check.bad { color: #c0392b; }
+  #cs-hint { font-size: 12px; font-weight: 700; padding: 7px 0; color: #5a6b7b; }
+  #cs-hint.bad { color: #c0392b; }
+  .chk { display: flex; align-items: center; gap: 6px; padding: 8px 0; font-size: 13px; cursor: pointer; }
   #form-error { color: #c0392b; font-weight: 600; margin-top: 10px; display: none; }
 
   /* Table */
@@ -72,7 +75,7 @@
 <body>
 
 <h1>Mernova Solutions — Founders Ledger</h1>
-<p class="subtitle">Revenue is entered VAT-inclusive (15%). Yehia's fee is 5% of net. Distributable splits 70% company (Khaled 40 / Lotfy 30 / Tarek 30) and 30% delivery (per-project percentages).</p>
+<p class="subtitle">Revenue is entered VAT-inclusive (15%). Yehia's fee is 5% of net. Distributable splits between Mernova (Khaled 40 / Lotfy 30 / Tarek 30) and delivery (per-project percentages) — default 70/30, adjustable per transaction.</p>
 
 <div class="toolbar">
   <label for="currency">Currency</label>
@@ -125,10 +128,34 @@
 
     <div class="field"><label for="f-amount" id="f-amount-label">Amount (gross, VAT-inclusive)</label><input type="number" id="f-amount" min="0" step="any" placeholder="0.00"></div>
 
+    <div class="field" id="fw-cs">
+      <label for="f-cs">Mernova share %</label>
+      <input type="number" class="pct" id="f-cs" min="0" max="100" step="any" value="70">
+    </div>
+    <div class="field" id="fw-cs-hint"><span id="cs-hint"></span></div>
+
+    <div class="field" id="fw-deq">
+      <label>Delivery split</label>
+      <label class="chk"><input type="checkbox" id="f-deq"> Equal — ⅓ each</label>
+    </div>
+
+    <div class="field" id="fw-dmode">
+      <label for="f-dmode">Delivery % entered as</label>
+      <select id="f-dmode">
+        <option value="pot">% of delivery share (total 100%)</option>
+        <option value="total">% of distributable (total = delivery %)</option>
+      </select>
+    </div>
+
     <div class="field" id="fw-dk"><label for="f-dk">Khaled delivery %</label><input type="number" class="pct" id="f-dk" min="0" max="100" step="any" placeholder="0"></div>
     <div class="field" id="fw-dl"><label for="f-dl">Lotfy delivery %</label><input type="number" class="pct" id="f-dl" min="0" max="100" step="any" placeholder="0"></div>
     <div class="field" id="fw-dt"><label for="f-dt">Tarek delivery %</label><input type="number" class="pct" id="f-dt" min="0" max="100" step="any" placeholder="0"></div>
     <div class="field" id="fw-check"><span id="delivery-check"></span></div>
+
+    <div class="field" id="fw-ck"><label for="f-ck">Khaled cost %</label><input type="number" class="pct" id="f-ck" min="0" max="100" step="any" value="40"></div>
+    <div class="field" id="fw-cl"><label for="f-cl">Lotfy cost %</label><input type="number" class="pct" id="f-cl" min="0" max="100" step="any" value="30"></div>
+    <div class="field" id="fw-ct"><label for="f-ct">Tarek cost %</label><input type="number" class="pct" id="f-ct" min="0" max="100" step="any" value="30"></div>
+    <div class="field" id="fw-ccheck"><span id="cost-check"></span></div>
 
     <div class="field"><label for="f-notes">Notes</label><input type="text" id="f-notes" placeholder="Optional"></div>
 
@@ -168,8 +195,7 @@
    ============================================================ */
 const VAT_RATE = 0.15;            // revenue entered gross: Net = Amount / 1.15
 const YEHIA_FEE_RATE = 0.05;      // 5% of Net
-const COMPANY_SHARE = 0.70;       // of Distributable
-const DELIVERY_SHARE = 0.30;      // of Distributable
+const DEFAULT_COMPANY_PCT = 70;   // Mernova share of Distributable, % — per-transaction override allowed; delivery gets the rest
 const COMPANY_SPLIT = { khaled: 0.40, lotfy: 0.30, tarek: 0.30 };  // fixed company split
 const COST_SPLIT    = { khaled: 0.40, lotfy: 0.30, tarek: 0.30 };  // fixed cost split
 
@@ -192,16 +218,27 @@ function computeRow(tx) {
     r.vat = tx.amount - r.net;
     r.yehia = YEHIA_FEE_RATE * r.net;
     const distributable = r.net - r.yehia;              // 0.95 × Net
-    const company = COMPANY_SHARE * distributable;      // 70%
-    const delivery = DELIVERY_SHARE * distributable;    // 30%
-    r.khaled = COMPANY_SPLIT.khaled * company + (tx.delivK / 100) * delivery;
-    r.lotfy  = COMPANY_SPLIT.lotfy  * company + (tx.delivL / 100) * delivery;
-    r.tarek  = COMPANY_SPLIT.tarek  * company + (tx.delivT / 100) * delivery;
+    const csPct = tx.companyShare ?? DEFAULT_COMPANY_PCT;  // per-transaction, default 70
+    const company = (csPct / 100) * distributable;
+    const delivery = (1 - csPct / 100) * distributable;
+    // delivery fractions: exact thirds when "equal" is chosen, else per-project %.
+    // "pot" mode: entries are % of the delivery share (÷100).
+    // "total" mode: entries are % of the distributable (÷ delivery share %),
+    // e.g. 15 out of a 30% delivery share → fraction 0.5.
+    const delivPct = 100 - csPct;
+    const denom = (tx.delivMode ?? "pot") === "total" ? delivPct : 100;
+    const fK = tx.delivEqual ? 1 / 3 : (denom > 0 ? tx.delivK / denom : 0);
+    const fL = tx.delivEqual ? 1 / 3 : (denom > 0 ? tx.delivL / denom : 0);
+    const fT = tx.delivEqual ? 1 / 3 : (denom > 0 ? tx.delivT / denom : 0);
+    r.khaled = COMPANY_SPLIT.khaled * company + fK * delivery;
+    r.lotfy  = COMPANY_SPLIT.lotfy  * company + fL * delivery;
+    r.tarek  = COMPANY_SPLIT.tarek  * company + fT * delivery;
     r.cash = r.net;                                     // net revenue enters company cash
   } else if (tx.type === "Cost") {
-    r.khaled = -COST_SPLIT.khaled * tx.amount;
-    r.lotfy  = -COST_SPLIT.lotfy  * tx.amount;
-    r.tarek  = -COST_SPLIT.tarek  * tx.amount;
+    // per-transaction cost split, default 40/30/30
+    r.khaled = -((tx.costK ?? COST_SPLIT.khaled * 100) / 100) * tx.amount;
+    r.lotfy  = -((tx.costL ?? COST_SPLIT.lotfy  * 100) / 100) * tx.amount;
+    r.tarek  = -((tx.costT ?? COST_SPLIT.tarek  * 100) / 100) * tx.amount;
     r.cash = -tx.amount;
   } else if (tx.type === "Withdrawal") {
     if (tx.person === "Khaled") r.khaled = -tx.amount;
@@ -275,7 +312,17 @@ function render() {
 
     let descCell = escapeHtml(tx.desc || (tx.type === "Withdrawal" ? "Withdrawal — " + tx.person : ""));
     if (tx.type === "Revenue") {
-      descCell += '<span class="deliv-tag">Delivery: K ' + tx.delivK + "% / L " + tx.delivL + "% / T " + tx.delivT + "%</span>";
+      const cs = tx.companyShare ?? DEFAULT_COMPANY_PCT;
+      const dtag = tx.delivEqual ? "split equally (⅓ each)"
+        : "K " + tx.delivK + "% / L " + tx.delivL + "% / T " + tx.delivT + "%" +
+          ((tx.delivMode ?? "pot") === "total" ? " of distributable" : "");
+      descCell += '<span class="deliv-tag">Mernova ' + cs + "% / Delivery " + (100 - cs) + "% — " + dtag + "</span>";
+    }
+    if (tx.type === "Cost") {
+      const ck = tx.costK ?? COST_SPLIT.khaled * 100;
+      const cl = tx.costL ?? COST_SPLIT.lotfy * 100;
+      const ct = tx.costT ?? COST_SPLIT.tarek * 100;
+      descCell += '<span class="deliv-tag">Cost split: K ' + ck + "% / L " + cl + "% / T " + ct + "%</span>";
     }
     if (tx.type === "Withdrawal" && tx.desc) {
       descCell = escapeHtml("Withdrawal — " + tx.person);
@@ -323,10 +370,52 @@ function updateFormFields() {
   el("f-desc").placeholder = isRev ? "Project name" : "Expense description";
   el("f-amount-label").textContent = isRev ? "Amount (gross, VAT-inclusive)" : "Amount";
   el("fw-person").style.display = isWd ? "" : "none";
-  for (const id of ["fw-dk", "fw-dl", "fw-dt", "fw-check"]) {
+  for (const id of ["fw-cs", "fw-cs-hint", "fw-deq"]) {
     el(id).style.display = isRev ? "" : "none";
   }
+  const showPcts = isRev && !el("f-deq").checked;
+  for (const id of ["fw-dmode", "fw-dk", "fw-dl", "fw-dt", "fw-check"]) {
+    el(id).style.display = showPcts ? "" : "none";
+  }
+  for (const id of ["fw-ck", "fw-cl", "fw-ct", "fw-ccheck"]) {
+    el(id).style.display = isCost ? "" : "none";
+  }
   updateDeliveryCheck();
+  updateCostCheck();
+  updateCsHint();
+}
+
+function updateCostCheck() {
+  if (el("f-type").value !== "Cost") return;
+  const sum = (parseFloat(el("f-ck").value) || 0) +
+              (parseFloat(el("f-cl").value) || 0) +
+              (parseFloat(el("f-ct").value) || 0);
+  const span = el("cost-check");
+  const ok = Math.abs(sum - 100) < 1e-9;
+  span.textContent = ok ? "Cost split total: 100% ✓" : "Cost split total: " + sum + "% — must total 100%";
+  span.className = ok ? "ok" : "bad";
+}
+
+function updateCsHint() {
+  if (el("f-type").value !== "Revenue") return;
+  const cs = parseFloat(el("f-cs").value);
+  const span = el("cs-hint");
+  if (isNaN(cs) || cs < 0 || cs > 100) {
+    span.textContent = "Mernova share must be between 0 and 100%";
+    span.className = "bad";
+  } else {
+    span.textContent = "Delivery share: " + (100 - cs) + "%";
+    span.className = "";
+  }
+}
+
+// In "pot" mode entries are % of the delivery share and must total 100.
+// In "total" mode entries are % of the distributable and must total the
+// delivery share % (e.g. 30 when Mernova share is 70).
+function deliveryTarget() {
+  if (el("f-dmode").value !== "total") return 100;
+  const cs = parseFloat(el("f-cs").value);
+  return isNaN(cs) ? NaN : 100 - cs;
 }
 
 function updateDeliveryCheck() {
@@ -334,9 +423,11 @@ function updateDeliveryCheck() {
   const sum = (parseFloat(el("f-dk").value) || 0) +
               (parseFloat(el("f-dl").value) || 0) +
               (parseFloat(el("f-dt").value) || 0);
+  const target = deliveryTarget();
   const span = el("delivery-check");
-  const ok = Math.abs(sum - 100) < 1e-9;
-  span.textContent = ok ? "Delivery total: 100% ✓" : "Delivery total: " + sum + "% — must total 100%";
+  const ok = !isNaN(target) && Math.abs(sum - target) < 1e-9;
+  span.textContent = ok ? "Delivery total: " + target + "% ✓"
+    : "Delivery total: " + sum + "% — must total " + (isNaN(target) ? "?" : target) + "%";
   span.className = ok ? "ok" : "bad";
 }
 
@@ -351,15 +442,21 @@ function resetForm() {
   el("f-date").value = new Date().toISOString().slice(0, 10);
   el("f-desc").value = "";
   el("f-amount").value = "";
+  el("f-cs").value = DEFAULT_COMPANY_PCT;
+  el("f-deq").checked = false;
+  el("f-dmode").value = "pot";
   el("f-dk").value = "";
   el("f-dl").value = "";
   el("f-dt").value = "";
+  el("f-ck").value = COST_SPLIT.khaled * 100;
+  el("f-cl").value = COST_SPLIT.lotfy * 100;
+  el("f-ct").value = COST_SPLIT.tarek * 100;
   el("f-notes").value = "";
   el("form-title").textContent = "Add transaction";
   el("btn-save").textContent = "Add transaction";
   el("btn-cancel").style.display = "none";
   showError("");
-  updateDeliveryCheck();
+  updateFormFields();
 }
 
 function saveTransaction() {
@@ -376,22 +473,52 @@ function saveTransaction() {
     date, type,
     desc: el("f-desc").value.trim(),
     amount,
+    companyShare: null,
+    delivEqual: false,
+    delivMode: "pot",
     delivK: null, delivL: null, delivT: null,
+    costK: null, costL: null, costT: null,
     person: null,
     notes: el("f-notes").value.trim(),
   };
 
   if (type === "Revenue") {
-    const dk = parseFloat(el("f-dk").value);
-    const dl = parseFloat(el("f-dl").value);
-    const dt = parseFloat(el("f-dt").value);
-    if ([dk, dl, dt].some((v) => isNaN(v) || v < 0)) {
-      return showError("Enter all three delivery percentages (0 or more).");
+    const cs = parseFloat(el("f-cs").value);
+    if (isNaN(cs) || cs < 0 || cs > 100) {
+      return showError("Mernova share must be between 0 and 100%.");
     }
-    if (Math.abs(dk + dl + dt - 100) >= 1e-9) {
-      return showError("Delivery percentages must total exactly 100%.");
+    tx.companyShare = cs;
+    if (el("f-deq").checked) {
+      tx.delivEqual = true;   // exact thirds, computed as 1/3 in computeRow
+    } else {
+      const dk = parseFloat(el("f-dk").value);
+      const dl = parseFloat(el("f-dl").value);
+      const dt = parseFloat(el("f-dt").value);
+      if ([dk, dl, dt].some((v) => isNaN(v) || v < 0)) {
+        return showError("Enter all three delivery percentages (0 or more).");
+      }
+      const mode = el("f-dmode").value;
+      const target = mode === "total" ? 100 - cs : 100;
+      if (mode === "total" && target === 0) {
+        return showError("Mernova share is 100% — there is no delivery share to split.");
+      }
+      if (Math.abs(dk + dl + dt - target) >= 1e-9) {
+        return showError("Delivery percentages must total exactly " + target + "%.");
+      }
+      tx.delivMode = mode;
+      tx.delivK = dk; tx.delivL = dl; tx.delivT = dt;
     }
-    tx.delivK = dk; tx.delivL = dl; tx.delivT = dt;
+  } else if (type === "Cost") {
+    const ck = parseFloat(el("f-ck").value);
+    const cl = parseFloat(el("f-cl").value);
+    const ct = parseFloat(el("f-ct").value);
+    if ([ck, cl, ct].some((v) => isNaN(v) || v < 0)) {
+      return showError("Enter all three cost split percentages (0 or more).");
+    }
+    if (Math.abs(ck + cl + ct - 100) >= 1e-9) {
+      return showError("Cost split percentages must total exactly 100%.");
+    }
+    tx.costK = ck; tx.costL = cl; tx.costT = ct;
   } else if (type === "Withdrawal") {
     tx.person = el("f-person").value;
   }
@@ -417,15 +544,25 @@ function startEdit(id) {
   el("f-amount").value = tx.amount;
   el("f-notes").value = tx.notes || "";
   if (tx.type === "Revenue") {
-    el("f-dk").value = tx.delivK;
-    el("f-dl").value = tx.delivL;
-    el("f-dt").value = tx.delivT;
+    el("f-cs").value = tx.companyShare ?? DEFAULT_COMPANY_PCT;
+    el("f-deq").checked = !!tx.delivEqual;
+    el("f-dmode").value = tx.delivMode ?? "pot";
+    el("f-dk").value = tx.delivEqual ? "" : tx.delivK;
+    el("f-dl").value = tx.delivEqual ? "" : tx.delivL;
+    el("f-dt").value = tx.delivEqual ? "" : tx.delivT;
+    updateFormFields();
+  }
+  if (tx.type === "Cost") {
+    el("f-ck").value = tx.costK ?? COST_SPLIT.khaled * 100;
+    el("f-cl").value = tx.costL ?? COST_SPLIT.lotfy * 100;
+    el("f-ct").value = tx.costT ?? COST_SPLIT.tarek * 100;
   }
   if (tx.type === "Withdrawal") el("f-person").value = tx.person;
   el("form-title").textContent = "Edit transaction";
   el("btn-save").textContent = "Save changes";
   el("btn-cancel").style.display = "";
   updateDeliveryCheck();
+  updateCsHint();
   window.scrollTo({ top: 0, behavior: "smooth" });
 }
 
@@ -485,6 +622,12 @@ function loadBackup(file) {
    when offline. Numbers are written at full precision; Excel
    handles display rounding, same rule as the app.
    ============================================================ */
+function normDeliv(tx, v) {
+  if ((tx.delivMode ?? "pot") !== "total") return v;
+  const delivPct = 100 - (tx.companyShare ?? DEFAULT_COMPANY_PCT);
+  return delivPct > 0 ? (v * 100) / delivPct : 0;
+}
+
 function buildExportData() {
   const cur = el("currency").value.trim() || "SAR";
   const b = computeBalances();
@@ -496,7 +639,9 @@ function buildExportData() {
   const txRows = [
     ["Date", "Type", "Project/Description", "Amount (gross)", "Net", "VAT",
      "Yehia fee Δ", "Khaled Δ", "Lotfy Δ", "Tarek Δ",
-     "Delivery K %", "Delivery L %", "Delivery T %", "Person", "Notes"],
+     "Mernova share %", "Delivery share %",
+     "Delivery K %", "Delivery L %", "Delivery T %",
+     "Cost K %", "Cost L %", "Cost T %", "Person", "Notes"],
   ];
   const totals = { gross: 0, net: 0, fees: 0, costs: 0, withdrawals: 0 };
   for (const tx of sorted) {
@@ -511,7 +656,16 @@ function buildExportData() {
       tx.amount,
       isRev ? r.net : "", isRev ? r.vat : "",
       r.yehia || "", r.khaled || "", r.lotfy || "", r.tarek || "",
-      isRev ? tx.delivK : "", isRev ? tx.delivL : "", isRev ? tx.delivT : "",
+      isRev ? (tx.companyShare ?? DEFAULT_COMPANY_PCT) : "",
+      isRev ? 100 - (tx.companyShare ?? DEFAULT_COMPANY_PCT) : "",
+      // delivery columns are always % of the delivery share, so total-mode
+      // entries are normalized (e.g. 15 of a 30% share exports as 50)
+      isRev ? (tx.delivEqual ? 100 / 3 : normDeliv(tx, tx.delivK)) : "",
+      isRev ? (tx.delivEqual ? 100 / 3 : normDeliv(tx, tx.delivL)) : "",
+      isRev ? (tx.delivEqual ? 100 / 3 : normDeliv(tx, tx.delivT)) : "",
+      tx.type === "Cost" ? (tx.costK ?? COST_SPLIT.khaled * 100) : "",
+      tx.type === "Cost" ? (tx.costL ?? COST_SPLIT.lotfy * 100) : "",
+      tx.type === "Cost" ? (tx.costT ?? COST_SPLIT.tarek * 100) : "",
       tx.type === "Withdrawal" ? tx.person : "",
       tx.notes || "",
     ]);
@@ -622,6 +776,10 @@ function exportExcel() {
 el("btn-export").addEventListener("click", exportExcel);
 el("f-type").addEventListener("change", updateFormFields);
 for (const id of ["f-dk", "f-dl", "f-dt"]) el(id).addEventListener("input", updateDeliveryCheck);
+for (const id of ["f-ck", "f-cl", "f-ct"]) el(id).addEventListener("input", updateCostCheck);
+el("f-cs").addEventListener("input", () => { updateCsHint(); updateDeliveryCheck(); });
+el("f-deq").addEventListener("change", updateFormFields);
+el("f-dmode").addEventListener("change", updateDeliveryCheck);
 el("btn-save").addEventListener("click", saveTransaction);
 el("btn-cancel").addEventListener("click", () => { resetForm(); });
 el("currency").addEventListener("input", render);
@@ -647,7 +805,34 @@ render();
 WORKED EXAMPLES — hand-checkable proof that the splits reconcile.
 These use the exact formulas in computeRow() above.
 
-EXAMPLE 1 — Revenue of 11,500 gross, delivery split 50/25/25
+The Mernova/delivery split of Distributable defaults to 70/30 but is a
+per-transaction input ("Mernova share %"). Examples 1–2 use the default;
+Example 3 shows an override.
+
+The delivery portion can also be marked "Equal — ⅓ each": internally each
+founder's fraction is exactly 1/3 (not a rounded 33.33%), so an equal split
+of e.g. 2,850 gives each founder exactly 950.00 and reconciles perfectly.
+
+Delivery percentages can be entered in either of two modes:
+  "pot" mode   — % of the delivery share itself, must total 100
+                 (e.g. 50/25/25).
+  "total" mode — % of the whole distributable, must total the delivery
+                 share % (e.g. with Mernova 70%, entries total 30:
+                 15/15/0 means half the delivery pot each for K and L,
+                 and 10/10/10 is an equal three-way split).
+Both describe the same fractions — 15/15/0 in total mode ≡ 50/50/0 in pot
+mode — so the money math is identical; only the entry convention differs.
+
+EXAMPLE 4 — Revenue of 11,500 gross, Mernova 70%, delivery entered in
+"total" mode as 15 / 15 / 0 (totals 30 = the delivery share)
+  Net / VAT / Yehia fee / Distributable: same as Example 1 (10,000 / 1,500 / 500 / 9,500)
+  Company share = 6,650.00 → Khaled 2,660.00 | Lotfy 1,995.00 | Tarek 1,995.00
+  Delivery share = 2,850.00, fractions 15/30 = ½, 15/30 = ½, 0/30 = 0
+      Khaled = 1,425.00 | Lotfy = 1,425.00 | Tarek = 0.00
+  Row credits: Khaled Δ = 4,085.00 | Lotfy Δ = 3,420.00 | Tarek Δ = 1,995.00 | Yehia Δ = 500.00
+  RECONCILIATION: 4,085.00 + 3,420.00 + 1,995.00 + 500.00 = 10,000.00 = Net ✓
+
+EXAMPLE 1 — Revenue of 11,500 gross, delivery split 50/25/25, Mernova share 70% (default)
   Net           = 11,500 / 1.15                 = 10,000.00
   VAT           = 11,500 − 10,000               =  1,500.00   (held for tax authority)
   Yehia fee     = 5% × 10,000                   =    500.00
@@ -668,12 +853,14 @@ EXAMPLE 1 — Revenue of 11,500 gross, delivery split 50/25/25
   RECONCILIATION: 4,085.00 + 2,707.50 + 2,707.50 + 500.00 = 10,000.00 = Net ✓
   Company cash +10,000.00; VAT held +1,500.00. (10,000 + 1,500 = 11,500 gross ✓)
 
-EXAMPLE 2 — Cost of 1,000
+EXAMPLE 2 — Cost of 1,000, split 40/30/30 (the default; editable per cost transaction)
       Khaled Δ = −40% × 1,000 = −400.00
       Lotfy  Δ = −30% × 1,000 = −300.00
       Tarek  Δ = −30% × 1,000 = −300.00
   RECONCILIATION: −400 − 300 − 300 = −1,000.00 = −cost ✓
   Company cash −1,000.00.
+  (With a custom split, e.g. 50/25/25: −500 / −250 / −250, still −1,000 total —
+   the split percentages are validated to sum to exactly 100.)
 
 COMBINED (both entries in the ledger):
       Khaled  = 4,085.00 − 400.00 = 3,685.00
@@ -684,6 +871,17 @@ COMBINED (both entries in the ledger):
       VAT     =                     1,500.00
   RECONCILIATION: 3,685.00 + 2,407.50 + 2,407.50 + 500.00 = 9,000.00 = cash ✓
   (Everyone's undrawn balance is exactly the cash sitting in the company.)
+
+EXAMPLE 3 — Same revenue as Example 1 (11,500 gross, delivery 50/25/25) but Mernova share set to 50%
+  Net / VAT / Yehia fee / Distributable: same as Example 1 (10,000 / 1,500 / 500 / 9,500)
+  Company share = 50% × 9,500                   =  4,750.00
+      Khaled 40%  = 1,900.00 | Lotfy 30% = 1,425.00 | Tarek 30% = 1,425.00
+  Delivery share = 50% × 9,500                  =  4,750.00
+      Khaled 50%  = 2,375.00 | Lotfy 25% = 1,187.50 | Tarek 25% = 1,187.50
+  Row credits: Khaled Δ = 4,275.00 | Lotfy Δ = 2,612.50 | Tarek Δ = 2,612.50 | Yehia Δ = 500.00
+  RECONCILIATION: 4,275.00 + 2,612.50 + 2,612.50 + 500.00 = 10,000.00 = Net ✓
+  The Mernova/delivery split only moves money BETWEEN the founders' company
+  and delivery portions — Net, VAT, Yehia's fee, and cash are unchanged.
 ============================================================ -->
 </body>
 </html>
