@@ -15,13 +15,6 @@
 
   .toolbar { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 20px; }
   .toolbar label { font-weight: 600; }
-  .toolbar select { padding: 7px 9px; border: 1px solid #c6d0da; border-radius: 6px; font-size: 13px; background: #fff; }
-  .fx { display: flex; align-items: center; gap: 6px; }
-  .fx label { font-weight: 600; font-size: 13px; }
-  #fx-rate { width: 110px; padding: 6px 8px; border: 1px solid #c6d0da; border-radius: 6px; }
-  #fx-code { font-weight: 700; }
-  #fx-status { flex-basis: 100%; font-size: 12px; color: #5a6b7b; }
-  #fx-status.bad { color: #c0392b; }
 
   button {
     padding: 8px 14px; border: 1px solid #c6d0da; border-radius: 6px; background: #fff;
@@ -58,8 +51,8 @@
   #delivery-check, #cost-check { font-size: 12px; font-weight: 700; padding: 7px 0; }
   #delivery-check.ok, #cost-check.ok { color: #1e8e3e; }
   #delivery-check.bad, #cost-check.bad { color: #c0392b; }
-  #cs-hint { font-size: 12px; font-weight: 700; padding: 7px 0; color: #5a6b7b; }
-  #cs-hint.bad { color: #c0392b; }
+  #cs-hint, #rate-hint { font-size: 12px; font-weight: 700; padding: 7px 0; color: #5a6b7b; }
+  #cs-hint.bad, #rate-hint.bad { color: #c0392b; }
   .chk { display: flex; align-items: center; gap: 6px; padding: 8px 0; font-size: 13px; cursor: pointer; }
   .chk input[type="checkbox"] { width: 16px; height: 16px; min-width: 0; flex: 0 0 auto; }
   #form-error { color: #c0392b; font-weight: 600; margin-top: 10px; display: none; }
@@ -110,24 +103,11 @@
 <p class="subtitle">Revenue is entered VAT-inclusive (15%). Net splits between Mernova (Khaled 30 / Lotfy 30 / Tarek 30 / Yehia 10) and delivery (per-project percentages, founders only) — default 70/30, adjustable per transaction.</p>
 
 <div class="toolbar">
-  <label for="currency">Currency</label>
-  <select id="currency">
-    <option value="SAR" selected>SAR</option>
-    <option>USD</option><option>EUR</option><option>GBP</option><option>EGP</option>
-    <option>AED</option><option>KWD</option><option>QAR</option><option>BHD</option>
-    <option>OMR</option><option>JOD</option><option>TRY</option>
-  </select>
-  <span class="fx" id="fx-wrap" style="display:none">
-    <label for="fx-rate">1 SAR =</label>
-    <input type="number" id="fx-rate" step="any" min="0" inputmode="decimal">
-    <span id="fx-code"></span>
-    <button id="btn-fx-refresh" type="button" title="Fetch the live global rate">↻ Auto rate</button>
-  </span>
+  <span>Currency: <strong>SAR</strong> <small style="color:#5a6b7b">— totals are always SAR; a transaction can be recorded in another currency and is converted on save.</small></span>
   <button id="btn-download">Download backup (JSON)</button>
   <button id="btn-load">Load backup (JSON)</button>
   <button id="btn-export">Export to Excel (.xlsx)</button>
   <input type="file" id="file-input" accept=".json,application/json" style="display:none">
-  <span id="fx-status"></span>
 </div>
 
 <div class="cards">
@@ -171,6 +151,24 @@
     </div>
 
     <div class="field"><label for="f-amount" id="f-amount-label">Amount (gross, VAT-inclusive)</label><input type="number" id="f-amount" min="0" step="any" inputmode="decimal" placeholder="0.00"></div>
+
+    <div class="field">
+      <label for="f-cur">Transaction currency</label>
+      <select id="f-cur">
+        <option value="SAR" selected>SAR</option>
+        <option>USD</option><option>EUR</option><option>GBP</option><option>EGP</option>
+        <option>AED</option><option>KWD</option><option>QAR</option><option>BHD</option>
+        <option>OMR</option><option>JOD</option><option>TRY</option>
+      </select>
+    </div>
+    <div class="field" id="fw-rate" style="display:none">
+      <label for="f-rate">1 <span id="f-rate-code"></span> = ? SAR</label>
+      <input type="number" class="pct" id="f-rate" min="0" step="any" inputmode="decimal" placeholder="0.00">
+    </div>
+    <div class="field" id="fw-rate-btn" style="display:none">
+      <button id="btn-rate" type="button" title="Fetch the live global rate">↻ Auto rate</button>
+    </div>
+    <div class="field" id="fw-rate-hint"><span id="rate-hint"></span></div>
 
     <div class="field" id="fw-cs">
       <label for="f-cs">Mernova share %</label>
@@ -251,11 +249,6 @@ const COST_SPLIT    = { khaled: 0.30, lotfy: 0.30, tarek: 0.30, yehia: 0.10 };  
 let transactions = [];  // {id, date, type, desc, amount, delivK, delivL, delivT, person, notes}
 let nextId = 1;
 let editingId = null;
-
-// Display currency. All stored amounts are ALWAYS in SAR (the base);
-// fx.rate converts for display/entry/export only — changing it later
-// never alters the ledger itself.
-let fx = { code: "SAR", rate: 1, source: "base", asOf: null };
 
 /* ============================================================
    CORE MATH — given one raw transaction, return its signed
@@ -348,8 +341,8 @@ function splitDetails(tx) {
    FORMATTING — rounding happens here and only here
    ============================================================ */
 function fmt(x) {
-  const n = (x * fx.rate).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-  return n + " " + fx.code;
+  const n = x.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  return n + " SAR";
 }
 function fmtSigned(x) {
   if (Math.abs(x) < 1e-9) return "—";
@@ -361,15 +354,20 @@ function signClass(x) {
 }
 
 /* ============================================================
-   EXCHANGE RATE — auto from a global rate API, manual override
+   TRANSACTION CURRENCY — a transaction can be recorded in
+   another currency; it is converted to SAR (the ledger base)
+   at save time using a rate fetched from a global rate API or
+   entered manually. The original amount/rate stay on the row.
    ============================================================ */
-function setFxStatus(msg, bad) {
-  const s = document.getElementById("fx-status");
+let rateSourceMsg = "";  // remembered so typing the amount keeps the source note
+
+function setRateHint(msg, bad) {
+  const s = document.getElementById("rate-hint");
   s.textContent = msg;
   s.className = bad ? "bad" : "";
 }
 
-async function fetchGlobalRate(code) {
+async function fetchRateToSAR(code) {
   const tryFetch = async (url, pick) => {
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), 8000);
@@ -380,68 +378,53 @@ async function fetchGlobalRate(code) {
       return v > 0 ? v : null;
     } catch { return null; } finally { clearTimeout(t); }
   };
-  return (await tryFetch("https://open.er-api.com/v6/latest/SAR",
-            (j) => j && j.rates && j.rates[code]))
-      || (await tryFetch("https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/sar.json",
-            (j) => j && j.sar && j.sar[code.toLowerCase()]));
+  return (await tryFetch("https://open.er-api.com/v6/latest/" + code,
+            (j) => j && j.rates && j.rates.SAR))
+      || (await tryFetch("https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/" + code.toLowerCase() + ".json",
+            (j) => j && j[code.toLowerCase()] && j[code.toLowerCase()].sar));
 }
 
-function updateFxUI() {
-  const el2 = document.getElementById("fx-wrap");
-  if (fx.code === "SAR") {
-    el2.style.display = "none";
-    setFxStatus("");
-  } else {
-    el2.style.display = "";
-    document.getElementById("fx-code").textContent = fx.code;
-    document.getElementById("fx-rate").value = fx.rate;
-    if (fx.source === "auto") {
-      setFxStatus("Global rate (auto), fetched " + fx.asOf + " — edit the rate to override. Ledger is stored in SAR; display converts at this rate.");
-    } else if (fx.source === "manual") {
-      setFxStatus("Manual rate — 1 SAR = " + fx.rate + " " + fx.code + ". Ledger is stored in SAR; display converts at this rate.");
-    }
-  }
+function updateRateHint(bad) {
+  const code = document.getElementById("f-cur").value;
+  if (code === "SAR") { setRateHint(""); return; }
+  const amount = parseFloat(document.getElementById("f-amount").value);
+  const rate = parseFloat(document.getElementById("f-rate").value);
+  let msg = rateSourceMsg;
+  if (amount > 0 && rate > 0) msg += (msg ? " • " : "") + "= " + fmt(amount * rate);
+  setRateHint(msg, bad);
 }
 
-async function autoFetchRate() {
-  const btn = document.getElementById("btn-fx-refresh");
+async function autoFetchTxRate() {
+  const code = document.getElementById("f-cur").value;
+  if (code === "SAR") return;
+  const btn = document.getElementById("btn-rate");
   btn.disabled = true;
-  setFxStatus("Fetching global rate for " + fx.code + "…");
-  const rate = await fetchGlobalRate(fx.code);
+  setRateHint("Fetching global rate for " + code + "…");
+  const rate = await fetchRateToSAR(code);
   btn.disabled = false;
   if (rate) {
-    fx.rate = rate;
-    fx.source = "auto";
-    fx.asOf = new Date().toISOString().slice(0, 10);
-    updateFxUI();
+    document.getElementById("f-rate").value = rate;
+    rateSourceMsg = "Global rate (auto) — edit to override";
+    updateRateHint();
   } else {
-    updateFxUI();
-    setFxStatus("Couldn't fetch a global rate (offline?). Enter the rate manually — 1 SAR = ? " + fx.code, true);
+    rateSourceMsg = "Couldn't fetch a rate (offline?) — enter it manually";
+    updateRateHint(true);
   }
+}
+
+// Sync the rate controls with the selected currency. Fetches a fresh rate
+// only when the rate box is empty (so editing a saved row keeps its rate).
+function onTxCurrencyChange() {
+  const code = document.getElementById("f-cur").value;
+  const show = code !== "SAR";
+  document.getElementById("fw-rate").style.display = show ? "" : "none";
+  document.getElementById("fw-rate-btn").style.display = show ? "" : "none";
+  document.getElementById("f-rate-code").textContent = code;
   updateFormFields();
-  render();
-}
-
-function syncCurrencySelect() {
-  const sel = document.getElementById("currency");
-  if (![...sel.options].some((o) => o.value === fx.code)) {
-    const o = document.createElement("option");
-    o.value = o.textContent = fx.code;
-    sel.appendChild(o);
-  }
-  sel.value = fx.code;
-}
-
-async function setCurrency(code) {
-  if (code === "SAR") {
-    fx = { code: "SAR", rate: 1, source: "base", asOf: null };
-    updateFxUI();
-    updateFormFields();
-    render();
+  if (show && !(parseFloat(document.getElementById("f-rate").value) > 0)) {
+    autoFetchTxRate();
   } else {
-    fx.code = code;
-    updateFxUI();
-    await autoFetchRate();
+    updateRateHint();
   }
 }
 
@@ -487,7 +470,11 @@ function render() {
       '<td class="text">' + tx.date + "</td>" +
       '<td class="text type-' + tx.type + '">' + tx.type + "</td>" +
       '<td class="text">' + descCell + "</td>" +
-      "<td>" + fmt(tx.amount) + "</td>" +
+      "<td>" + fmt(tx.amount) +
+        (tx.cur && tx.cur !== "SAR"
+          ? '<span class="deliv-tag">' + escapeHtml(tx.curAmount + " " + tx.cur + " @ " + tx.curRate) + "</span>"
+          : "") +
+      "</td>" +
       "<td>" + (tx.type === "Revenue" ? fmt(r.net) : "—") + "</td>" +
       "<td>" + (tx.type === "Revenue" ? fmt(r.vat) : "—") + "</td>" +
       '<td class="' + signClass(r.yehia) + '">' + fmtSigned(r.yehia) + "</td>" +
@@ -521,7 +508,7 @@ function updateFormFields() {
   el("fw-desc").style.display = isWd ? "none" : "";
   el("f-desc-label").textContent = isRev ? "Project" : "Description";
   el("f-desc").placeholder = isRev ? "Project name" : "Expense description";
-  el("f-amount-label").textContent = (isRev ? "Amount (gross, VAT-inclusive)" : "Amount") + " — " + fx.code;
+  el("f-amount-label").textContent = (isRev ? "Amount (gross, VAT-inclusive)" : "Amount") + " — " + el("f-cur").value;
   el("fw-person").style.display = isWd ? "" : "none";
   for (const id of ["fw-cs", "fw-cs-hint", "fw-deq"]) {
     el(id).style.display = isRev ? "" : "none";
@@ -596,6 +583,10 @@ function resetForm() {
   el("f-date").value = new Date().toISOString().slice(0, 10);
   el("f-desc").value = "";
   el("f-amount").value = "";
+  el("f-cur").value = "SAR";
+  el("f-rate").value = "";
+  rateSourceMsg = "";
+  onTxCurrencyChange();
   el("f-cs").value = DEFAULT_COMPANY_PCT;
   el("f-deq").checked = false;
   el("f-dmode").value = "pot";
@@ -623,11 +614,19 @@ function saveTransaction() {
   if (!date) return showError("Date is required.");
   if (!(amount > 0)) return showError("Amount must be a positive number.");
 
+  const cur = el("f-cur").value;
+  let curRate = 1;
+  if (cur !== "SAR") {
+    curRate = parseFloat(el("f-rate").value);
+    if (!(curRate > 0)) return showError("Enter a valid exchange rate (1 " + cur + " = ? SAR).");
+  }
+
   const tx = {
     id: editingId ?? nextId++,
     date, type,
     desc: el("f-desc").value.trim(),
-    amount: amount / fx.rate,   // entered in the display currency, stored in SAR base
+    amount: amount * curRate,   // stored in SAR base
+    cur, curAmount: amount, curRate,  // as-entered record for audit
     companyShare: null,
     delivEqual: false,
     delivMode: "pot",
@@ -697,7 +696,12 @@ function startEdit(id) {
   updateFormFields();
   el("f-date").value = tx.date;
   el("f-desc").value = tx.desc || "";
-  el("f-amount").value = tx.amount * fx.rate;  // base SAR shown in the display currency
+  const foreign = tx.cur && tx.cur !== "SAR";
+  el("f-cur").value = foreign ? tx.cur : "SAR";
+  el("f-rate").value = foreign ? tx.curRate : "";
+  rateSourceMsg = foreign ? "Saved rate — edit to override" : "";
+  el("f-amount").value = foreign ? tx.curAmount : tx.amount;
+  onTxCurrencyChange();
   el("f-notes").value = tx.notes || "";
   if (tx.type === "Revenue") {
     el("f-cs").value = tx.companyShare ?? DEFAULT_COMPANY_PCT;
@@ -741,9 +745,7 @@ function downloadBackup() {
     app: "mernova-founders-ledger",
     version: 1,
     exportedAt: new Date().toISOString(),
-    baseCurrency: "SAR",  // all transaction amounts below are stored in SAR
-    currency: fx.code,
-    fx: { ...fx },
+    baseCurrency: "SAR",  // tx.amount is always SAR; cur/curAmount/curRate record the original entry
     transactions,
   };
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
@@ -767,17 +769,6 @@ function loadBackup(file) {
       }
       transactions = data.transactions;
       nextId = transactions.reduce((m, t) => Math.max(m, t.id || 0), 0) + 1;
-      if (data.fx && data.fx.code) {
-        fx = { code: data.fx.code, rate: data.fx.rate > 0 ? data.fx.rate : 1,
-               source: data.fx.source || "manual", asOf: data.fx.asOf || null };
-      } else if (data.currency && data.currency !== "SAR") {
-        // old backups had a free-text currency label and no rate
-        fx = { code: data.currency, rate: 1, source: "manual", asOf: null };
-      } else {
-        fx = { code: "SAR", rate: 1, source: "base", asOf: null };
-      }
-      syncCurrencySelect();
-      updateFxUI();
       resetForm();
       render();
     } catch (err) {
@@ -799,8 +790,7 @@ function normDeliv(tx, v) {
 }
 
 function buildExportData() {
-  const cur = fx.code;
-  const M = (v) => v * fx.rate;  // convert base-SAR values to the display currency
+  const cur = "SAR";
   const b = computeBalances();
 
   const sorted = [...transactions].sort((a, z) =>
@@ -812,7 +802,8 @@ function buildExportData() {
      "Yehia Δ", "Khaled Δ", "Lotfy Δ", "Tarek Δ",
      "Mernova share %", "Delivery share %",
      "Delivery K %", "Delivery L %", "Delivery T %",
-     "Cost K %", "Cost L %", "Cost T %", "Cost Y %", "Person", "Notes"],
+     "Cost K %", "Cost L %", "Cost T %", "Cost Y %",
+     "Entered amount", "Entered currency", "Rate → SAR", "Person", "Notes"],
   ];
   const rowTypes = [];  // aligned with txRows data rows; drives per-row styling
   const totals = { gross: 0, net: 0, fees: 0, costs: 0, withdrawals: 0 };
@@ -827,10 +818,9 @@ function buildExportData() {
       tx.date, tx.type,
       tx.type === "Withdrawal" ? "Withdrawal — " + tx.person : (tx.desc || ""),
       splitDetails(tx),
-      M(tx.amount),
-      isRev ? M(r.net) : "", isRev ? M(r.vat) : "",
-      r.yehia ? M(r.yehia) : "", r.khaled ? M(r.khaled) : "",
-      r.lotfy ? M(r.lotfy) : "", r.tarek ? M(r.tarek) : "",
+      tx.amount,
+      isRev ? r.net : "", isRev ? r.vat : "",
+      r.yehia || "", r.khaled || "", r.lotfy || "", r.tarek || "",
       isRev ? (tx.companyShare ?? DEFAULT_COMPANY_PCT) : "",
       isRev ? 100 - (tx.companyShare ?? DEFAULT_COMPANY_PCT) : "",
       // delivery columns are always % of the delivery share, so total-mode
@@ -842,6 +832,9 @@ function buildExportData() {
       tx.type === "Cost" ? costShares(tx).cl : "",
       tx.type === "Cost" ? costShares(tx).ct : "",
       tx.type === "Cost" ? costShares(tx).cy : "",
+      tx.cur && tx.cur !== "SAR" ? tx.curAmount : "",
+      tx.cur && tx.cur !== "SAR" ? tx.cur : "",
+      tx.cur && tx.cur !== "SAR" ? tx.curRate : "",
       tx.type === "Withdrawal" ? tx.person : "",
       tx.notes || "",
     ]);
@@ -849,18 +842,18 @@ function buildExportData() {
   if (transactions.length > 0) {
     rowTypes.push("totals");
     txRows.push(["", "", "TOTALS (Δ columns = balances)", "", "",
-      M(totals.net), M(b.vat), M(b.yehia), M(b.khaled), M(b.lotfy), M(b.tarek),
-      "", "", "", "", "", "", "", "", "", "", ""]);
+      totals.net, b.vat, b.yehia, b.khaled, b.lotfy, b.tarek,
+      "", "", "", "", "", "", "", "", "", "", "", "", "", ""]);
   }
 
   const balRows = [
     ["Account", "Balance (" + cur + ")", "Note"],
-    ["Khaled Rashad", M(b.khaled), "Founder — sum of his Δ column"],
-    ["Lotfy Nashaat", M(b.lotfy), "Founder — sum of his Δ column"],
-    ["Tarek A. Elgaabary", M(b.tarek), "Founder — sum of his Δ column"],
-    ["Yehia", M(b.yehia), "Shareholder (10% of Mernova share) — sum of his Δ column"],
-    ["Company cash", M(b.cash), "Net revenue − costs − withdrawals. Cash not yet withdrawn is the company's balance."],
-    ["VAT held", M(b.vat), "Owed to the tax authority — not part of anyone's equity."],
+    ["Khaled Rashad", b.khaled, "Founder — sum of his Δ column"],
+    ["Lotfy Nashaat", b.lotfy, "Founder — sum of his Δ column"],
+    ["Tarek A. Elgaabary", b.tarek, "Founder — sum of his Δ column"],
+    ["Yehia", b.yehia, "Shareholder (10% of Mernova share) — sum of his Δ column"],
+    ["Company cash", b.cash, "Net revenue − costs − withdrawals. Cash not yet withdrawn is the company's balance."],
+    ["VAT held", b.vat, "Owed to the tax authority — not part of anyone's equity."],
   ];
 
   const sumPeople = b.khaled + b.lotfy + b.tarek + b.yehia;
@@ -868,28 +861,25 @@ function buildExportData() {
   const dashRows = [
     ["Mernova Solutions — Shareholders Ledger & Profit Split"],
     ["Exported", new Date().toISOString()],
-    ["Currency", cur + (fx.code === "SAR" ? "" : " (converted from SAR base)")],
-    ...(fx.code === "SAR" ? [] : [["Exchange rate",
-      "1 SAR = " + fx.rate + " " + fx.code +
-      (fx.source === "auto" ? " (global rate, " + fx.asOf + ")" : " (manual)")]]),
+    ["Currency", "SAR (foreign-currency entries are converted to SAR at their recorded rate)"],
     ["Transactions", transactions.length],
     [],
     ["Totals"],
-    ["Gross revenue (VAT-inclusive)", M(totals.gross)],
-    ["Net revenue", M(totals.net)],
-    ["VAT collected", M(b.vat)],
-    ["Yehia revenue share", M(totals.fees)],
-    ["Costs paid", M(totals.costs)],
-    ["Withdrawals", M(totals.withdrawals)],
+    ["Gross revenue (VAT-inclusive)", totals.gross],
+    ["Net revenue", totals.net],
+    ["VAT collected", b.vat],
+    ["Yehia revenue share", totals.fees],
+    ["Costs paid", totals.costs],
+    ["Withdrawals", totals.withdrawals],
     [],
     ["Balances"],
     ...balRows.slice(1),
     [],
     ["Reconciliation check"],
-    ["Sum of personal balances", M(sumPeople)],
-    ["Company cash", M(b.cash)],
+    ["Sum of personal balances", sumPeople],
+    ["Company cash", b.cash],
     // clamp float residue (~1e-12) so a reconciled ledger shows a clean 0
-    ["Difference (must be 0)", Math.abs(reconDiff) < 1e-9 ? 0 : M(reconDiff)],
+    ["Difference (must be 0)", Math.abs(reconDiff) < 1e-9 ? 0 : reconDiff],
   ];
 
   return { txRows, rowTypes, balRows, dashRows, cur };
@@ -949,11 +939,12 @@ function makeStyles(cur) {
 function styleTransactionsSheet(XLSX, ws, txRows, rowTypes, S) {
   const MONEY_COLS = [4, 5, 6, 7, 8, 9, 10];
   const PCT_COLS = [11, 12, 13, 14, 15, 16, 17, 18, 19];
+  const ENTERED_AMT_COL = 20, RATE_COL = 22;  // original-currency record
   ws["!cols"] = [
     { wch: 11 }, { wch: 11 }, { wch: 26 }, { wch: 44 }, { wch: 15 }, { wch: 15 },
     { wch: 13 }, { wch: 13 }, { wch: 14 }, { wch: 14 }, { wch: 14 }, { wch: 9 },
     { wch: 9 }, { wch: 9 }, { wch: 9 }, { wch: 9 }, { wch: 8 }, { wch: 8 },
-    { wch: 8 }, { wch: 8 }, { wch: 10 }, { wch: 24 },
+    { wch: 8 }, { wch: 8 }, { wch: 13 }, { wch: 9 }, { wch: 11 }, { wch: 10 }, { wch: 24 },
   ];
   ws["!rows"] = [{ hpt: 28 }];
   for (let r = 0; r < txRows.length; r++) {
@@ -975,6 +966,8 @@ function styleTransactionsSheet(XLSX, ws, txRows, rowTypes, S) {
       if (typeof cell.v === "number") {
         if (MONEY_COLS.includes(c)) s.numFmt = S.MONEY;
         if (PCT_COLS.includes(c)) s.numFmt = S.PCT;
+        if (c === ENTERED_AMT_COL) s.numFmt = "#,##0.00";  // foreign currency, no SAR label
+        if (c === RATE_COL) s.numFmt = "0.####";
       }
       if (c === 1 && meta !== "totals") {
         s.font = { sz: 10, bold: true, color: { rgb: S.typeColor[cell.v] || "1C2733" } };
@@ -1085,18 +1078,14 @@ el("f-deq").addEventListener("change", updateFormFields);
 el("f-dmode").addEventListener("change", updateDeliveryCheck);
 el("btn-save").addEventListener("click", saveTransaction);
 el("btn-cancel").addEventListener("click", () => { resetForm(); });
-el("currency").addEventListener("change", (e) => setCurrency(e.target.value));
-el("fx-rate").addEventListener("input", () => {
-  const v = parseFloat(el("fx-rate").value);
-  if (v > 0) {
-    fx.rate = v;
-    fx.source = "manual";
-    setFxStatus("Manual rate — 1 SAR = " + v + " " + fx.code + ". Ledger is stored in SAR; display converts at this rate.");
-    updateFormFields();
-    render();
-  }
+el("f-cur").addEventListener("change", () => {
+  el("f-rate").value = "";   // currency changed: the old rate no longer applies
+  rateSourceMsg = "";
+  onTxCurrencyChange();
 });
-el("btn-fx-refresh").addEventListener("click", autoFetchRate);
+el("f-rate").addEventListener("input", () => { rateSourceMsg = "Manual rate"; updateRateHint(); });
+el("f-amount").addEventListener("input", () => updateRateHint());
+el("btn-rate").addEventListener("click", autoFetchTxRate);
 el("btn-download").addEventListener("click", downloadBackup);
 el("btn-load").addEventListener("click", () => el("file-input").click());
 el("file-input").addEventListener("change", (e) => {
@@ -1118,6 +1107,13 @@ render();
 <!-- ============================================================
 WORKED EXAMPLES — hand-checkable proof that the splits reconcile.
 These use the exact formulas in computeRow() above.
+
+CURRENCY: the ledger base is SAR and all totals/balances are SAR. A
+transaction may be recorded in another currency; it is converted to SAR
+at save time (amount × rate, rate auto-fetched or manual) and the split
+math below always runs on the SAR value. The original amount, currency,
+and rate stay on the row for audit. E.g. a 100 USD cost @ 3.75 enters
+the ledger as a 375.00 SAR cost.
 
 SHAREHOLDER MODEL (no fees): all four people are shareholders.
   Net (= Amount / 1.15) is distributed in full:
