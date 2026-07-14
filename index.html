@@ -73,6 +73,7 @@
   .type-Cost { color: #c0392b; font-weight: 700; }
   .type-Withdrawal { color: #b8860b; font-weight: 700; }
   .type-Payroll { color: #7b1fa2; font-weight: 700; }
+  .type-Capital { color: #0f766e; font-weight: 700; }
   .empty-row td { text-align: center; color: #7a8a99; padding: 24px; }
 
   /* Mobile */
@@ -118,7 +119,7 @@
   <div class="card"><div class="label">Yehia</div><div class="value" id="bal-yehia"></div></div>
   <div class="card cash">
     <div class="label">Company cash</div><div class="value" id="bal-cash"></div>
-    <div class="note">Net revenue in − costs − withdrawals. Payroll accrues to the payee's balance and reduces cash only when withdrawn.</div>
+    <div class="note">Net revenue + capital in − costs − withdrawals. Payroll accrues to the payee's balance and reduces cash only when withdrawn.</div>
   </div>
   <div class="card vat">
     <div class="label">VAT held</div><div class="value" id="bal-vat"></div>
@@ -136,6 +137,7 @@
         <option value="Revenue">Revenue</option>
         <option value="Cost">Cost</option>
         <option value="Payroll">Payroll</option>
+        <option value="Capital">Capital (money in)</option>
         <option value="Withdrawal">Withdrawal</option>
       </select>
     </div>
@@ -304,6 +306,14 @@ function computeRow(tx) {
     else if (tx.person === "Tarek") r.tarek += tx.amount;
     else if (tx.person === "Yehia") r.yehia += tx.amount;
     r.cash = 0;
+  } else if (tx.type === "Capital") {
+    // capital injection: the contributor pumps money into the company —
+    // cash rises and the same amount is credited to their balance
+    if (tx.person === "Khaled") r.khaled = tx.amount;
+    else if (tx.person === "Lotfy") r.lotfy = tx.amount;
+    else if (tx.person === "Tarek") r.tarek = tx.amount;
+    else if (tx.person === "Yehia") r.yehia = tx.amount;
+    r.cash = tx.amount;
   } else if (tx.type === "Withdrawal") {
     if (tx.person === "Khaled") r.khaled = -tx.amount;
     else if (tx.person === "Lotfy") r.lotfy = -tx.amount;
@@ -356,6 +366,9 @@ function splitDetails(tx) {
   if (tx.type === "Payroll") {
     const c = costShares(tx);
     return "Payroll to " + tx.person + " (accrued to balance) — borne: K " + c.ck + "% / L " + c.cl + "% / T " + c.ct + "% / Y " + c.cy + "%";
+  }
+  if (tx.type === "Capital") {
+    return "Capital in from " + tx.person + " — credited to their balance and company cash";
   }
   return "";
 }
@@ -482,6 +495,7 @@ function render() {
 
     let descCell = escapeHtml(
       tx.type === "Withdrawal" ? "Withdrawal — " + tx.person
+      : tx.type === "Capital" ? "Capital in — " + tx.person
       : tx.type === "Payroll" ? "Payroll — " + tx.person + (tx.desc ? " — " + tx.desc : "")
       : (tx.desc || ""));
     const details = splitDetails(tx);
@@ -525,13 +539,14 @@ function updateFormFields() {
   const isRev = type === "Revenue";
   const isCost = type === "Cost";
   const isPay = type === "Payroll";
+  const isCap = type === "Capital";
   const isWd = type === "Withdrawal";
 
-  el("fw-desc").style.display = isWd ? "none" : "";
+  el("fw-desc").style.display = (isWd || isCap) ? "none" : "";
   el("f-desc-label").textContent = isRev ? "Project" : "Description";
   el("f-desc").placeholder = isRev ? "Project name" : isPay ? "e.g. July salary (optional)" : "Expense description";
   el("f-amount-label").textContent = (isRev ? "Amount (gross, VAT-inclusive)" : "Amount") + " — " + el("f-cur").value;
-  el("fw-person").style.display = (isWd || isPay) ? "" : "none";
+  el("fw-person").style.display = (isWd || isPay || isCap) ? "" : "none";
   for (const id of ["fw-cs", "fw-cs-hint", "fw-deq"]) {
     el(id).style.display = isRev ? "" : "none";
   }
@@ -698,7 +713,7 @@ function saveTransaction() {
     }
     tx.costK = ck; tx.costL = cl; tx.costT = ct; tx.costY = cy;
     if (type === "Payroll") tx.person = el("f-person").value;  // payee
-  } else if (type === "Withdrawal") {
+  } else if (type === "Withdrawal" || type === "Capital") {
     tx.person = el("f-person").value;
   }
 
@@ -743,7 +758,7 @@ function startEdit(id) {
     el("f-ct").value = c.ct;
     el("f-cy").value = c.cy;
   }
-  if (tx.type === "Withdrawal" || tx.type === "Payroll") el("f-person").value = tx.person;
+  if (tx.type === "Withdrawal" || tx.type === "Payroll" || tx.type === "Capital") el("f-person").value = tx.person;
   el("form-title").textContent = "Edit transaction";
   el("btn-save").textContent = "Save changes";
   el("btn-cancel").style.display = "";
@@ -787,7 +802,7 @@ function loadBackup(file) {
       const data = JSON.parse(reader.result);
       if (!data || !Array.isArray(data.transactions)) throw new Error("bad shape");
       for (const t of data.transactions) {
-        if (!t.date || !["Revenue", "Cost", "Payroll", "Withdrawal"].includes(t.type) || !(t.amount > 0)) {
+        if (!t.date || !["Revenue", "Cost", "Payroll", "Capital", "Withdrawal"].includes(t.type) || !(t.amount > 0)) {
           throw new Error("bad transaction row");
         }
       }
@@ -830,18 +845,20 @@ function buildExportData() {
      "Entered amount", "Entered currency", "Rate → SAR", "Person", "Notes"],
   ];
   const rowTypes = [];  // aligned with txRows data rows; drives per-row styling
-  const totals = { gross: 0, net: 0, fees: 0, costs: 0, payroll: 0, withdrawals: 0 };
+  const totals = { gross: 0, net: 0, fees: 0, costs: 0, payroll: 0, capital: 0, withdrawals: 0 };
   for (const tx of sorted) {
     const r = computeRow(tx);
     const isRev = tx.type === "Revenue";
     if (isRev) { totals.gross += tx.amount; totals.net += r.net; totals.fees += r.yehia; }
     if (tx.type === "Cost") totals.costs += tx.amount;
     if (tx.type === "Payroll") totals.payroll += tx.amount;
+    if (tx.type === "Capital") totals.capital += tx.amount;
     if (tx.type === "Withdrawal") totals.withdrawals += tx.amount;
     rowTypes.push(tx.type);
     txRows.push([
       tx.date, tx.type,
       tx.type === "Withdrawal" ? "Withdrawal — " + tx.person
+        : tx.type === "Capital" ? "Capital in — " + tx.person
         : tx.type === "Payroll" ? "Payroll — " + tx.person + (tx.desc ? " — " + tx.desc : "")
         : (tx.desc || ""),
       splitDetails(tx),
@@ -862,7 +879,7 @@ function buildExportData() {
       tx.cur && tx.cur !== "SAR" ? tx.curAmount : "",
       tx.cur && tx.cur !== "SAR" ? tx.cur : "",
       tx.cur && tx.cur !== "SAR" ? tx.curRate : "",
-      tx.type === "Withdrawal" || tx.type === "Payroll" ? tx.person : "",
+      tx.type === "Withdrawal" || tx.type === "Payroll" || tx.type === "Capital" ? tx.person : "",
       tx.notes || "",
     ]);
   }
@@ -879,7 +896,7 @@ function buildExportData() {
     ["Lotfy Nashaat", b.lotfy, "Founder — sum of his Δ column"],
     ["Tarek A. Elgaabary", b.tarek, "Founder — sum of his Δ column"],
     ["Yehia", b.yehia, "Shareholder (10% of Mernova share) — sum of his Δ column"],
-    ["Company cash", b.cash, "Net revenue − costs − withdrawals. Payroll accrues to the payee's balance and reduces cash only when withdrawn."],
+    ["Company cash", b.cash, "Net revenue + capital in − costs − withdrawals. Payroll accrues to the payee's balance and reduces cash only when withdrawn."],
     ["VAT held", b.vat, "Owed to the tax authority — not part of anyone's equity."],
   ];
 
@@ -898,6 +915,7 @@ function buildExportData() {
     ["Yehia revenue share", totals.fees],
     ["Costs paid", totals.costs],
     ["Payroll accrued (credited to payees, withdrawn later)", totals.payroll],
+    ["Capital in", totals.capital],
     ["Withdrawals", totals.withdrawals],
     [],
     ["Balances"],
@@ -958,7 +976,7 @@ function makeStyles(cur) {
       border: { top: thin, bottom: thin, left: thin, right: thin } },
     section: { font: { sz: 10, bold: true, color: { rgb: "FFFFFF" } },
       fill: { patternType: "solid", fgColor: { rgb: "5A7A9B" } } },
-    typeColor: { Revenue: "1E8E3E", Cost: "C0392B", Withdrawal: "B8860B", Payroll: "7B1FA2" },
+    typeColor: { Revenue: "1E8E3E", Cost: "C0392B", Withdrawal: "B8860B", Payroll: "7B1FA2", Capital: "0F766E" },
     zebra: "F2F6FA", totalsFill: "DCE6F1", cashFill: "DDEBF7",
     vatFill: "FFF2CC", okFill: "E2EFDA", badFill: "FCE4E0",
   };
@@ -1198,6 +1216,12 @@ Withdrawal. E.g. a 5,000 payroll to Yehia:
       Cash: unchanged. Net people-delta = 0, so balances still = cash ✓
 When Yehia later withdraws the 5,000: Yehia Δ −5,000, cash −5,000 —
 the log shows he earned the salary and exactly when it left the company.
+
+CAPITAL (money in): someone pumps money into the company. Company cash
+rises by the amount and the SAME amount is credited to the contributor's
+balance — the company owes it back to them (they recover it later as a
+Withdrawal). E.g. Khaled injects 20,000: cash +20,000; Khaled Δ +20,000;
+nobody else affected. Balances still = cash ✓. No split, no VAT.
 
 EXAMPLE 2 — Cost of 1,000, split 30/30/30/10 (the default; editable per cost transaction)
       Khaled Δ = −30% × 1,000 = −300.00
