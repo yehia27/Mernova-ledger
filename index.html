@@ -74,6 +74,11 @@
   .type-Withdrawal { color: #b8860b; font-weight: 700; }
   .type-Payroll { color: #7b1fa2; font-weight: 700; }
   .type-Capital { color: #0f766e; font-weight: 700; }
+  .type-VAT { color: #546e7a; font-weight: 700; }
+  .type-Refund { color: #e65100; font-weight: 700; }
+  .type-Zakat { color: #795548; font-weight: 700; }
+  .type-Transfer { color: #1565c0; font-weight: 700; }
+  #vat-hint { font-size: 12px; font-weight: 700; padding: 7px 0; color: #b8860b; }
   .empty-row td { text-align: center; color: #7a8a99; padding: 24px; }
 
   /* Mobile */
@@ -135,17 +140,21 @@
       <label for="f-type">Type</label>
       <select id="f-type">
         <option value="Revenue">Revenue</option>
+        <option value="Refund">Refund (revenue reversal)</option>
         <option value="Cost">Cost</option>
+        <option value="Zakat">Zakat / income tax</option>
         <option value="Payroll">Payroll</option>
         <option value="Capital">Capital (money in)</option>
+        <option value="VAT">VAT payment</option>
         <option value="Withdrawal">Withdrawal</option>
+        <option value="Transfer">Transfer between partners</option>
       </select>
     </div>
 
     <div class="field" id="fw-desc"><label for="f-desc" id="f-desc-label">Project</label><input type="text" id="f-desc" placeholder="Project name"></div>
 
     <div class="field" id="fw-person" style="display:none">
-      <label for="f-person">Person</label>
+      <label for="f-person" id="f-person-label">Person</label>
       <select id="f-person">
         <option value="Khaled">Khaled</option>
         <option value="Lotfy">Lotfy</option>
@@ -153,6 +162,18 @@
         <option value="Yehia">Yehia</option>
       </select>
     </div>
+
+    <div class="field" id="fw-person2" style="display:none">
+      <label for="f-person2">To</label>
+      <select id="f-person2">
+        <option value="Khaled">Khaled</option>
+        <option value="Lotfy">Lotfy</option>
+        <option value="Tarek">Tarek</option>
+        <option value="Yehia">Yehia</option>
+      </select>
+    </div>
+
+    <div class="field" id="fw-vathint" style="display:none"><span id="vat-hint"></span></div>
 
     <div class="field"><label for="f-amount" id="f-amount-label">Amount (gross, VAT-inclusive)</label><input type="number" id="f-amount" min="0" step="any" inputmode="decimal" placeholder="0.00"></div>
 
@@ -260,9 +281,12 @@ let editingId = null;
    ============================================================ */
 function computeRow(tx) {
   const r = { net: 0, vat: 0, yehia: 0, khaled: 0, lotfy: 0, tarek: 0, cash: 0 };
-  if (tx.type === "Revenue") {
-    r.net = tx.amount / (1 + VAT_RATE);
-    r.vat = tx.amount - r.net;
+  if (tx.type === "Revenue" || tx.type === "Refund") {
+    // Refund = exact reversal of a revenue: identical split math with the
+    // sign flipped, so every bucket (net, VAT, deltas, cash) is undone.
+    const gross = (tx.type === "Refund" ? -1 : 1) * tx.amount;
+    r.net = gross / (1 + VAT_RATE);
+    r.vat = gross - r.net;
     const distributable = r.net;                        // no fee — full Net is distributed
     const csPct = tx.companyShare ?? DEFAULT_COMPANY_PCT;  // per-transaction, default 70
     const company = (csPct / 100) * distributable;
@@ -281,9 +305,10 @@ function computeRow(tx) {
     r.lotfy  = COMPANY_SPLIT.lotfy  * company + fL * delivery;
     r.tarek  = COMPANY_SPLIT.tarek  * company + fT * delivery;
     r.cash = r.net;                                     // net revenue enters company cash
-  } else if (tx.type === "Cost") {
-    // company expense, borne by the shareholders per the per-transaction
-    // split, default 30/30/30/10.
+  } else if (tx.type === "Cost" || tx.type === "Zakat") {
+    // company expense (Zakat/income tax gets its own label for reporting),
+    // borne by the shareholders per the per-transaction split, default
+    // 30/30/30/10.
     const c = costShares(tx);
     r.khaled = -(c.ck / 100) * tx.amount;
     r.lotfy  = -(c.cl / 100) * tx.amount;
@@ -314,12 +339,23 @@ function computeRow(tx) {
     else if (tx.person === "Tarek") r.tarek = tx.amount;
     else if (tx.person === "Yehia") r.yehia = tx.amount;
     r.cash = tx.amount;
+  } else if (tx.type === "VAT") {
+    // paying collected VAT to the tax authority: reduces the VAT-held
+    // bucket only. VAT never entered company cash (cash receives Net),
+    // so neither cash nor anyone's balance moves.
+    r.vat = -tx.amount;
   } else if (tx.type === "Withdrawal") {
     if (tx.person === "Khaled") r.khaled = -tx.amount;
     else if (tx.person === "Lotfy") r.lotfy = -tx.amount;
     else if (tx.person === "Tarek") r.tarek = -tx.amount;
     else if (tx.person === "Yehia") r.yehia = -tx.amount;
     r.cash = -tx.amount;
+  } else if (tx.type === "Transfer") {
+    // settle between partners: debit the sender's balance, credit the
+    // receiver's. Cash and VAT untouched — net people-delta is 0.
+    const key = (p) => ({ Khaled: "khaled", Lotfy: "lotfy", Tarek: "tarek", Yehia: "yehia" })[p];
+    if (key(tx.person)) r[key(tx.person)] -= tx.amount;
+    if (key(tx.person2)) r[key(tx.person2)] += tx.amount;
   }
   return r;
 }
@@ -352,16 +388,21 @@ function computeBalances() {
 // Human-readable description of a transaction's split settings — shown as
 // the tag under the description in the table and in the Excel export.
 function splitDetails(tx) {
-  if (tx.type === "Revenue") {
+  if (tx.type === "Revenue" || tx.type === "Refund") {
     const cs = tx.companyShare ?? DEFAULT_COMPANY_PCT;
     const dtag = tx.delivEqual ? "split equally (⅓ each)"
       : "K " + tx.delivK + "% / L " + tx.delivL + "% / T " + tx.delivT + "%" +
         ((tx.delivMode ?? "pot") === "total" ? " of distributable" : "");
-    return "Mernova " + cs + "% / Delivery " + (100 - cs) + "% — " + dtag;
+    return (tx.type === "Refund" ? "Refund (reverses the split) — " : "") +
+      "Mernova " + cs + "% / Delivery " + (100 - cs) + "% — " + dtag;
   }
-  if (tx.type === "Cost") {
+  if (tx.type === "Cost" || tx.type === "Zakat") {
     const c = costShares(tx);
-    return "Cost split: K " + c.ck + "% / L " + c.cl + "% / T " + c.ct + "% / Y " + c.cy + "%";
+    return (tx.type === "Zakat" ? "Zakat/tax" : "Cost") +
+      " split: K " + c.ck + "% / L " + c.cl + "% / T " + c.ct + "% / Y " + c.cy + "%";
+  }
+  if (tx.type === "Transfer") {
+    return "Transfer " + tx.person + " → " + tx.person2 + " — balances only, cash unchanged";
   }
   if (tx.type === "Payroll") {
     const c = costShares(tx);
@@ -369,6 +410,9 @@ function splitDetails(tx) {
   }
   if (tx.type === "Capital") {
     return "Capital in from " + tx.person + " — credited to their balance and company cash";
+  }
+  if (tx.type === "VAT") {
+    return "Paid to tax authority — reduces VAT held (no equity or cash impact)";
   }
   return "";
 }
@@ -495,8 +539,12 @@ function render() {
 
     let descCell = escapeHtml(
       tx.type === "Withdrawal" ? "Withdrawal — " + tx.person
+      : tx.type === "VAT" ? "VAT payment — tax authority"
       : tx.type === "Capital" ? "Capital in — " + tx.person
       : tx.type === "Payroll" ? "Payroll — " + tx.person + (tx.desc ? " — " + tx.desc : "")
+      : tx.type === "Transfer" ? "Transfer — " + tx.person + " → " + tx.person2
+      : tx.type === "Refund" ? "Refund — " + (tx.desc || "")
+      : tx.type === "Zakat" ? (tx.desc || "Zakat / income tax")
       : (tx.desc || ""));
     const details = splitDetails(tx);
     if (details) descCell += '<span class="deliv-tag">' + escapeHtml(details) + "</span>";
@@ -510,8 +558,8 @@ function render() {
           ? '<span class="deliv-tag">' + escapeHtml(tx.curAmount + " " + tx.cur + " @ " + tx.curRate) + "</span>"
           : "") +
       "</td>" +
-      "<td>" + (tx.type === "Revenue" ? fmt(r.net) : "—") + "</td>" +
-      "<td>" + (tx.type === "Revenue" ? fmt(r.vat) : "—") + "</td>" +
+      '<td class="' + signClass(r.net) + '">' + (r.net ? fmt(r.net) : "—") + "</td>" +
+      '<td class="' + signClass(r.vat) + '">' + (r.vat ? fmt(r.vat) : "—") + "</td>" +
       '<td class="' + signClass(r.yehia) + '">' + fmtSigned(r.yehia) + "</td>" +
       '<td class="' + signClass(r.khaled) + '">' + fmtSigned(r.khaled) + "</td>" +
       '<td class="' + signClass(r.lotfy) + '">' + fmtSigned(r.lotfy) + "</td>" +
@@ -523,6 +571,9 @@ function render() {
       "</td>";
     tbody.appendChild(tr);
   }
+  // keep the "VAT currently held" hint live while the VAT form is open
+  const typeSel = document.getElementById("f-type");
+  if (typeSel && typeSel.value === "VAT") updateVatHint();
 }
 
 function escapeHtml(s) {
@@ -536,17 +587,27 @@ const el = (id) => document.getElementById(id);
 
 function updateFormFields() {
   const type = el("f-type").value;
-  const isRev = type === "Revenue";
-  const isCost = type === "Cost";
+  const isRev = type === "Revenue" || type === "Refund";   // refund shares the revenue form
+  const isCost = type === "Cost" || type === "Zakat";      // zakat shares the cost form
   const isPay = type === "Payroll";
   const isCap = type === "Capital";
+  const isVat = type === "VAT";
   const isWd = type === "Withdrawal";
+  const isTr = type === "Transfer";
 
-  el("fw-desc").style.display = (isWd || isCap) ? "none" : "";
+  el("fw-desc").style.display = (isWd || isCap || isVat || isTr) ? "none" : "";
   el("f-desc-label").textContent = isRev ? "Project" : "Description";
-  el("f-desc").placeholder = isRev ? "Project name" : isPay ? "e.g. July salary (optional)" : "Expense description";
+  el("f-desc").placeholder = type === "Revenue" ? "Project name"
+    : type === "Refund" ? "Refunded project name"
+    : isPay ? "e.g. July salary (optional)"
+    : type === "Zakat" ? "e.g. Zakat 2026 (optional)"
+    : "Expense description";
   el("f-amount-label").textContent = (isRev ? "Amount (gross, VAT-inclusive)" : "Amount") + " — " + el("f-cur").value;
-  el("fw-person").style.display = (isWd || isPay || isCap) ? "" : "none";
+  el("fw-person").style.display = (isWd || isPay || isCap || isTr) ? "" : "none";
+  el("f-person-label").textContent = isTr ? "From" : "Person";
+  el("fw-person2").style.display = isTr ? "" : "none";
+  el("fw-vathint").style.display = isVat ? "" : "none";
+  if (isVat) updateVatHint();
   for (const id of ["fw-cs", "fw-cs-hint", "fw-deq"]) {
     el(id).style.display = isRev ? "" : "none";
   }
@@ -562,9 +623,14 @@ function updateFormFields() {
   updateCsHint();
 }
 
+function updateVatHint() {
+  document.getElementById("vat-hint").textContent =
+    "VAT currently held: " + fmt(computeBalances().vat);
+}
+
 function updateCostCheck() {
   const type = el("f-type").value;
-  if (type !== "Cost" && type !== "Payroll") return;
+  if (type !== "Cost" && type !== "Payroll" && type !== "Zakat") return;
   const sum = (parseFloat(el("f-ck").value) || 0) +
               (parseFloat(el("f-cl").value) || 0) +
               (parseFloat(el("f-ct").value) || 0) +
@@ -576,7 +642,8 @@ function updateCostCheck() {
 }
 
 function updateCsHint() {
-  if (el("f-type").value !== "Revenue") return;
+  const _t = el("f-type").value;
+  if (_t !== "Revenue" && _t !== "Refund") return;
   const cs = parseFloat(el("f-cs").value);
   const span = el("cs-hint");
   if (isNaN(cs) || cs < 0 || cs > 100) {
@@ -598,7 +665,8 @@ function deliveryTarget() {
 }
 
 function updateDeliveryCheck() {
-  if (el("f-type").value !== "Revenue") return;
+  const _t = el("f-type").value;
+  if (_t !== "Revenue" && _t !== "Refund") return;
   const sum = (parseFloat(el("f-dk").value) || 0) +
               (parseFloat(el("f-dl").value) || 0) +
               (parseFloat(el("f-dt").value) || 0);
@@ -671,10 +739,11 @@ function saveTransaction() {
     delivK: null, delivL: null, delivT: null,
     costK: null, costL: null, costT: null, costY: null,
     person: null,
+    person2: null,
     notes: el("f-notes").value.trim(),
   };
 
-  if (type === "Revenue") {
+  if (type === "Revenue" || type === "Refund") {
     const cs = parseFloat(el("f-cs").value);
     if (isNaN(cs) || cs < 0 || cs > 100) {
       return showError("Mernova share must be between 0 and 100%.");
@@ -700,7 +769,7 @@ function saveTransaction() {
       tx.delivMode = mode;
       tx.delivK = dk; tx.delivL = dl; tx.delivT = dt;
     }
-  } else if (type === "Cost" || type === "Payroll") {
+  } else if (type === "Cost" || type === "Zakat" || type === "Payroll") {
     const ck = parseFloat(el("f-ck").value);
     const cl = parseFloat(el("f-cl").value);
     const ct = parseFloat(el("f-ct").value);
@@ -715,6 +784,12 @@ function saveTransaction() {
     if (type === "Payroll") tx.person = el("f-person").value;  // payee
   } else if (type === "Withdrawal" || type === "Capital") {
     tx.person = el("f-person").value;
+  } else if (type === "Transfer") {
+    tx.person = el("f-person").value;
+    tx.person2 = el("f-person2").value;
+    if (tx.person === tx.person2) {
+      return showError("Transfer needs two different people.");
+    }
   }
 
   if (editingId !== null) {
@@ -742,7 +817,7 @@ function startEdit(id) {
   el("f-amount").value = foreign ? tx.curAmount : tx.amount;
   onTxCurrencyChange();
   el("f-notes").value = tx.notes || "";
-  if (tx.type === "Revenue") {
+  if (tx.type === "Revenue" || tx.type === "Refund") {
     el("f-cs").value = tx.companyShare ?? DEFAULT_COMPANY_PCT;
     el("f-deq").checked = !!tx.delivEqual;
     el("f-dmode").value = tx.delivMode ?? "pot";
@@ -751,14 +826,15 @@ function startEdit(id) {
     el("f-dt").value = tx.delivEqual ? "" : tx.delivT;
     updateFormFields();
   }
-  if (tx.type === "Cost" || tx.type === "Payroll") {
+  if (tx.type === "Cost" || tx.type === "Zakat" || tx.type === "Payroll") {
     const c = costShares(tx);
     el("f-ck").value = c.ck;
     el("f-cl").value = c.cl;
     el("f-ct").value = c.ct;
     el("f-cy").value = c.cy;
   }
-  if (tx.type === "Withdrawal" || tx.type === "Payroll" || tx.type === "Capital") el("f-person").value = tx.person;
+  if (["Withdrawal", "Payroll", "Capital", "Transfer"].includes(tx.type)) el("f-person").value = tx.person;
+  if (tx.type === "Transfer") el("f-person2").value = tx.person2;
   el("form-title").textContent = "Edit transaction";
   el("btn-save").textContent = "Save changes";
   el("btn-cancel").style.display = "";
@@ -802,7 +878,7 @@ function loadBackup(file) {
       const data = JSON.parse(reader.result);
       if (!data || !Array.isArray(data.transactions)) throw new Error("bad shape");
       for (const t of data.transactions) {
-        if (!t.date || !["Revenue", "Cost", "Payroll", "Capital", "Withdrawal"].includes(t.type) || !(t.amount > 0)) {
+        if (!t.date || !["Revenue", "Refund", "Cost", "Zakat", "Payroll", "Capital", "VAT", "Withdrawal", "Transfer"].includes(t.type) || !(t.amount > 0)) {
           throw new Error("bad transaction row");
         }
       }
@@ -845,25 +921,34 @@ function buildExportData() {
      "Entered amount", "Entered currency", "Rate → SAR", "Person", "Notes"],
   ];
   const rowTypes = [];  // aligned with txRows data rows; drives per-row styling
-  const totals = { gross: 0, net: 0, fees: 0, costs: 0, payroll: 0, capital: 0, withdrawals: 0 };
+  const totals = { gross: 0, refunds: 0, net: 0, fees: 0, costs: 0, zakat: 0, payroll: 0, capital: 0, withdrawals: 0, transfers: 0, vatCollected: 0, vatPaid: 0 };
   for (const tx of sorted) {
     const r = computeRow(tx);
-    const isRev = tx.type === "Revenue";
-    if (isRev) { totals.gross += tx.amount; totals.net += r.net; totals.fees += r.yehia; }
+    const isRev = tx.type === "Revenue" || tx.type === "Refund";  // refund = negative revenue
+    if (isRev) { totals.net += r.net; totals.fees += r.yehia; totals.vatCollected += r.vat; }
+    if (tx.type === "Revenue") totals.gross += tx.amount;
+    if (tx.type === "Refund") totals.refunds += tx.amount;
+    if (tx.type === "VAT") totals.vatPaid += tx.amount;
     if (tx.type === "Cost") totals.costs += tx.amount;
+    if (tx.type === "Zakat") totals.zakat += tx.amount;
     if (tx.type === "Payroll") totals.payroll += tx.amount;
     if (tx.type === "Capital") totals.capital += tx.amount;
     if (tx.type === "Withdrawal") totals.withdrawals += tx.amount;
+    if (tx.type === "Transfer") totals.transfers += tx.amount;
     rowTypes.push(tx.type);
     txRows.push([
       tx.date, tx.type,
       tx.type === "Withdrawal" ? "Withdrawal — " + tx.person
+        : tx.type === "VAT" ? "VAT payment — tax authority"
         : tx.type === "Capital" ? "Capital in — " + tx.person
         : tx.type === "Payroll" ? "Payroll — " + tx.person + (tx.desc ? " — " + tx.desc : "")
+        : tx.type === "Transfer" ? "Transfer — " + tx.person + " → " + tx.person2
+        : tx.type === "Refund" ? "Refund — " + (tx.desc || "")
+        : tx.type === "Zakat" ? (tx.desc || "Zakat / income tax")
         : (tx.desc || ""),
       splitDetails(tx),
       tx.amount,
-      isRev ? r.net : "", isRev ? r.vat : "",
+      isRev ? r.net : "", r.vat ? r.vat : "",
       r.yehia || "", r.khaled || "", r.lotfy || "", r.tarek || "",
       isRev ? (tx.companyShare ?? DEFAULT_COMPANY_PCT) : "",
       isRev ? 100 - (tx.companyShare ?? DEFAULT_COMPANY_PCT) : "",
@@ -872,14 +957,15 @@ function buildExportData() {
       isRev ? (tx.delivEqual ? 100 / 3 : normDeliv(tx, tx.delivK)) : "",
       isRev ? (tx.delivEqual ? 100 / 3 : normDeliv(tx, tx.delivL)) : "",
       isRev ? (tx.delivEqual ? 100 / 3 : normDeliv(tx, tx.delivT)) : "",
-      tx.type === "Cost" || tx.type === "Payroll" ? costShares(tx).ck : "",
-      tx.type === "Cost" || tx.type === "Payroll" ? costShares(tx).cl : "",
-      tx.type === "Cost" || tx.type === "Payroll" ? costShares(tx).ct : "",
-      tx.type === "Cost" || tx.type === "Payroll" ? costShares(tx).cy : "",
+      ["Cost", "Zakat", "Payroll"].includes(tx.type) ? costShares(tx).ck : "",
+      ["Cost", "Zakat", "Payroll"].includes(tx.type) ? costShares(tx).cl : "",
+      ["Cost", "Zakat", "Payroll"].includes(tx.type) ? costShares(tx).ct : "",
+      ["Cost", "Zakat", "Payroll"].includes(tx.type) ? costShares(tx).cy : "",
       tx.cur && tx.cur !== "SAR" ? tx.curAmount : "",
       tx.cur && tx.cur !== "SAR" ? tx.cur : "",
       tx.cur && tx.cur !== "SAR" ? tx.curRate : "",
-      tx.type === "Withdrawal" || tx.type === "Payroll" || tx.type === "Capital" ? tx.person : "",
+      tx.type === "Transfer" ? tx.person + " → " + tx.person2
+        : ["Withdrawal", "Payroll", "Capital"].includes(tx.type) ? tx.person : "",
       tx.notes || "",
     ]);
   }
@@ -910,13 +996,17 @@ function buildExportData() {
     [],
     ["Totals"],
     ["Gross revenue (VAT-inclusive)", totals.gross],
-    ["Net revenue", totals.net],
-    ["VAT collected", b.vat],
+    ["Refunds (gross, reversed)", totals.refunds],
+    ["Net revenue (after refunds)", totals.net],
+    ["VAT collected", totals.vatCollected],
+    ["VAT paid to tax authority", totals.vatPaid],
     ["Yehia revenue share", totals.fees],
     ["Costs paid", totals.costs],
+    ["Zakat / income tax paid", totals.zakat],
     ["Payroll accrued (credited to payees, withdrawn later)", totals.payroll],
     ["Capital in", totals.capital],
     ["Withdrawals", totals.withdrawals],
+    ["Transfers between partners (balance moves, no cash)", totals.transfers],
     [],
     ["Balances"],
     ...balRows.slice(1),
@@ -976,7 +1066,8 @@ function makeStyles(cur) {
       border: { top: thin, bottom: thin, left: thin, right: thin } },
     section: { font: { sz: 10, bold: true, color: { rgb: "FFFFFF" } },
       fill: { patternType: "solid", fgColor: { rgb: "5A7A9B" } } },
-    typeColor: { Revenue: "1E8E3E", Cost: "C0392B", Withdrawal: "B8860B", Payroll: "7B1FA2", Capital: "0F766E" },
+    typeColor: { Revenue: "1E8E3E", Refund: "E65100", Cost: "C0392B", Zakat: "795548",
+      Withdrawal: "B8860B", Payroll: "7B1FA2", Capital: "0F766E", VAT: "546E7A", Transfer: "1565C0" },
     zebra: "F2F6FA", totalsFill: "DCE6F1", cashFill: "DDEBF7",
     vatFill: "FFF2CC", okFill: "E2EFDA", badFill: "FCE4E0",
   };
@@ -1216,6 +1307,29 @@ Withdrawal. E.g. a 5,000 payroll to Yehia:
       Cash: unchanged. Net people-delta = 0, so balances still = cash ✓
 When Yehia later withdraws the 5,000: Yehia Δ −5,000, cash −5,000 —
 the log shows he earned the salary and exactly when it left the company.
+
+REFUND (revenue reversal): money returned to a client. Identical split
+math to a Revenue with the sign flipped — Net, VAT, every Δ, and cash are
+all negated, using the SAME Mernova share % and delivery percentages as
+the original project. E.g. refunding the full 11,500 of Example 1 exactly
+undoes it: K −3,600 / L −2,850 / T −2,850 / Y −700, cash −10,000,
+VAT held −1,500. Both rows stay in the log for history.
+
+ZAKAT / INCOME TAX: a real expense of the shareholders (unlike VAT, which
+is held money that was never theirs). Same math as a Cost — cash −amount,
+borne per the editable split (default 30/30/30/10) — but labeled
+separately so reports show tax payments on their own line.
+
+TRANSFER BETWEEN PARTNERS: settles balances without cash moving. Debits
+the sender's balance and credits the receiver's by the same amount; cash
+and VAT untouched. E.g. Khaled transfers 1,000 to Yehia: Khaled −1,000,
+Yehia +1,000, everything else unchanged. Balances still = cash ✓.
+
+VAT PAYMENT: paying collected VAT to the tax authority. Reduces the
+VAT-held bucket ONLY — VAT never entered company cash (cash receives the
+Net), so neither cash nor anyone's balance moves. E.g. after Example 1
+the ledger holds 1,500 VAT; a VAT payment of 1,500 brings VAT held to 0.
+Balances and cash: unchanged ✓.
 
 CAPITAL (money in): someone pumps money into the company. Company cash
 rises by the amount and the SAME amount is credited to the contributor's
