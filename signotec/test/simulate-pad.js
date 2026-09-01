@@ -12,6 +12,7 @@ const fs = require('fs');
 const PATH = require('path').join(__dirname, '..', 'signotec_final.js');
 
 let sent = [], deviceOpen = false, failAt = null, dropReplyFor = null;
+let hideCanvas = false;
 const elements = {};
 const el = (id, extra) => (elements[id] ||= Object.assign({
   id, value: '', src: id + '.png', checked: false, disabled: false,
@@ -28,7 +29,9 @@ const canvasStub = () => ({ width: 640, height: 480, getContext: ctxStub,
                             toDataURL: () => 'data:image/png;base64,Q09NUE9TSVRF' });
 
 global.document = {
-  getElementById: (id) => (id === 'sigCanvas' ? el(id, canvasStub()) : el(id)),
+  getElementById: (id) => (id === 'sigCanvas'
+    ? (hideCanvas ? null : el(id, canvasStub()))
+    : el(id)),
   createElement: (t) => (t === 'canvas' ? canvasStub() : { textContent:'', appendChild(){}, style:{} })
 };
 global.window = { WebSocket: function(){} };
@@ -44,8 +47,13 @@ const realLog = console.log.bind(console);
 let logLines = [];
 global.console = { log: (m) => { logLines.push(String(m)); } };
 
+let socketOpenDelay = 0;
 global.WebSocket = class {
-  constructor(){ setTimeout(() => this.onopen && this.onopen({target:{url:'wss://x'}}), 0); }
+  constructor(){
+    this.readyState = 0;                       // CONNECTING
+    setTimeout(() => { this.readyState = 1;    // OPEN
+      this.onopen && this.onopen({ target:{ url:'wss://x' } }); }, socketOpenDelay);
+  }
   send(msg){ const o = JSON.parse(msg); sent.push(o.TOKEN_CMD); setTimeout(() => respond(o), 0); }
 };
 
@@ -103,6 +111,7 @@ const UNDO_SEQ = JSON.stringify([
 
 async function fullSession() {
   sent = []; hotspotId = 0; logLines = []; jqCalls = [];
+  signoPADAPIWeb = null;
   onMainWindowLoad(); await wait();
   getSignature();     await wait(500);
 }
@@ -214,6 +223,46 @@ async function fullSession() {
   check('pad closed after a failed command', okOpen && !deviceOpen, 'deviceOpen=' + deviceOpen);
 
   clearTimeout(T);
+  section('Connection is opened lazily and sends are queued');
+  signoPADAPIWeb = null; sent = []; hotspotId = 0; logLines = []; socketOpenDelay = 60;
+  // getSignature() without onMainWindowLoad(), and while the socket is still CONNECTING
+  getSignature();
+  check('nothing sent while connecting', sent.length === 0, seq());
+  check('first command was queued', logLines.some(l => l.includes('queued until the connection')), 'not queued');
+  await wait(600);
+  check('session completes after the socket opens',
+        deviceOpen && sent.includes('TOKEN_CMD_API_SIGNATURE_START'), seq());
+  socketOpenDelay = 0;
+  press(confirmButton); await wait(300);
+
+  section('Missing #sigCanvas at load is not fatal');
+  signoPADAPIWeb = null; sent = []; logLines = []; hideCanvas = true;
+  onMainWindowLoad(); await wait();
+  check('connection still created', signoPADAPIWeb !== null, 'null');
+  check('absence is noted, not fatal', logLines.some(l => l.includes('will look again')), 'no note');
+  getSignature(); await wait(100);
+  check('getSignature reports the missing canvas',
+        logLines.some(l => l.includes('cannot capture a signature')), 'no error');
+  hideCanvas = false;
+  sent = []; hotspotId = 0;
+  getSignature(); await wait(500);
+  check('works once the canvas appears',
+        deviceOpen && sent.includes('TOKEN_CMD_API_SIGNATURE_START'), seq());
+
+  section('Diagnostics');
+  const diag = signotecDiagnostics();
+  check('reports an open connection', diag.connection === 'OPEN', diag.connection);
+  check('reports the pad profile',    diag.padProfile === 'Omega', diag.padProfile);
+  check('reports the pad as opened',  diag.padState === 'opened', diag.padState);
+
+  section('Server drops the connection mid-session');
+  strokeOf(4, 900);
+  signoPADAPIWeb.readyState = 3; signoPADAPIWeb.onclose({ target:{ url:'wss://x' } });
+  check('state reset on close', padState === padStates.closed && undoState === undoStates.idle,
+        'padState=' + padState);
+  sent = []; press(retryButton); await wait(200);
+  check('no sends on a closed socket', !sent.length, seq());
+
   realLog('\n' + (fails === 0 ? '\x1b[32mALL CHECKS PASSED\x1b[0m' : '\x1b[31m' + fails + ' CHECK(S) FAILED\x1b[0m'));
   process.exit(fails ? 1 : 0);
 })();

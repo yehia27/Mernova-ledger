@@ -104,3 +104,20 @@ from 2556 lines to 1723, and every remaining line is reachable.
 `clearSignature()`, `check_boxes_selectedElements_onchange()` and
 `ModeListName_onchange()` are kept as guarded no-ops, since the HTML may
 still reference them from inline handlers.
+
+## If the pad does not open
+
+Run this in the browser console once the page is loaded:
+
+```js
+signotecDiagnostics()
+```
+
+It reports the connection state, whether `#sigCanvas` and `#log` were found,
+the pad type and whether it is supported, and where each state machine is
+sitting. It also writes the same line into `#log`.
+
+The connection is opened lazily and is re-checked by `getSignature()`, so a
+page where `onMainWindowLoad()` never ran, or where `#sigCanvas` is created
+later inside a dialog, still works. Commands issued before the socket is open
+are queued and flushed on `onopen` rather than throwing `InvalidStateError`.

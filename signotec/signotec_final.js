@@ -401,7 +401,31 @@ function logResponseError(what, obj) {
         " | TOKEN_PARAM_ERROR_DESCRIPTION=" + obj.TOKEN_PARAM_ERROR_DESCRIPTION);
 }
 
+// Messages queued while the socket is still connecting. Without this, a
+// getSignature() that runs before the connection is established would throw
+// InvalidStateError and the session would never start.
+var pendingMessages = [];
+
 function sendMessage(message) {
+    if (signoPADAPIWeb === null) {
+        logMessage("!! not connected to the signotec service, dropped: " + shortenForLog(message));
+        return false;
+    }
+
+    // readyState is undefined on the ActiveX object, which is always ready
+    var readyState = signoPADAPIWeb.readyState;
+
+    if (readyState === 0 /* CONNECTING */) {
+        logMessage("-- queued until the connection is open: " + shortenForLog(message));
+        pendingMessages.push(message);
+        return true;
+    }
+
+    if (readyState === 2 /* CLOSING */ || readyState === 3 /* CLOSED */) {
+        logMessage("!! connection is closed, dropped: " + shortenForLog(message));
+        return false;
+    }
+
     logMessage(">> " + message);
     try {
         signoPADAPIWeb.send(message);
@@ -409,6 +433,20 @@ function sendMessage(message) {
     } catch (e) {
         logMessage("!! send failed: " + e);
         return false;
+    }
+}
+
+function flushPendingMessages() {
+    var queued = pendingMessages;
+    pendingMessages = [];
+
+    for (var i = 0; i < queued.length; i++) {
+        logMessage(">> " + queued[i]);
+        try {
+            signoPADAPIWeb.send(queued[i]);
+        } catch (e) {
+            logMessage("!! send failed: " + e);
+        }
     }
 }
 
@@ -438,35 +476,85 @@ function resetPipelineState() {
 
 function onMainWindowLoad() {
     statusElement = byId("status");
-    sigcanvas = byId("sigCanvas");
 
+    // #sigCanvas may live inside a dialog that is built later, so its absence
+    // here is not fatal: getSignature() resolves it again when signing starts.
+    sigcanvas = byId("sigCanvas");
     if (sigcanvas === null) {
-        setStatus("sigCanvas element not found", "fail");
-        logMessage("!! sigCanvas element not found");
-        return;
+        logMessage("-- sigCanvas not in the DOM yet, will look again on getSignature()");
     }
 
-    if (typeof window !== "undefined" && window.WebSocket === undefined) {
-        setStatus("WebSockets are not supported by this browser", "fail");
-        logMessage("!! WebSockets are not supported by this browser");
-        return;
+    connectToService();
+
+    clearSignature();
+    check_boxes_selectedElements_onchange();
+}
+
+/**
+ * Opens the connection to the local signotec service. Safe to call more than
+ * once: an existing connection is kept. Returns true when a connection object
+ * exists afterwards.
+ */
+function connectToService() {
+    if (signoPADAPIWeb !== null) {
+        return true;
     }
 
     try {
         // legacy Internet Explorer path
         signoPADAPIWeb = new ActiveXObject("signotec.STPadActiveXServer");
         setStatus("ActiveX loaded", "success");
-    } catch (e) {
-        signoPADAPIWeb = new WebSocket(wsUri);
-        signoPADAPIWeb.onopen = onOpen;
-        signoPADAPIWeb.onclose = onClose;
-        signoPADAPIWeb.onerror = onError;
+        logMessage("-- connected through the ActiveX server");
+    } catch (activeXError) {
+        try {
+            signoPADAPIWeb = new WebSocket(wsUri);
+            signoPADAPIWeb.onopen = onOpen;
+            signoPADAPIWeb.onclose = onClose;
+            signoPADAPIWeb.onerror = onError;
+            logMessage("-- connecting to " + wsUri);
+        } catch (socketError) {
+            signoPADAPIWeb = null;
+            setStatus("Could not connect to the signotec service", "fail");
+            logMessage("!! could not open " + wsUri + ": " + socketError);
+            return false;
+        }
     }
 
     signoPADAPIWeb.onmessage = onMessage;
+    return true;
+}
 
-    clearSignature();
-    check_boxes_selectedElements_onchange();
+/**
+ * Dump of everything needed to diagnose a stalled session. Call
+ * signotecDiagnostics() from the browser console.
+ */
+function signotecDiagnostics() {
+    var socketState = "no connection object";
+    if (signoPADAPIWeb !== null) {
+        socketState = (signoPADAPIWeb.readyState === undefined)
+            ? "ActiveX"
+            : ["CONNECTING", "OPEN", "CLOSING", "CLOSED"][signoPADAPIWeb.readyState];
+    }
+
+    var info = {
+        wsUri: wsUri,
+        connection: socketState,
+        sigCanvasFound: byId("sigCanvas") !== null,
+        logElementFound: byId("log") !== null,
+        padState: (padState === padStates.opened) ? "opened" : "closed",
+        padType: getReadableType(padType),
+        padProfile: getPadProfile() === null ? "UNSUPPORTED" : getPadProfile().imageId,
+        backgroundTemplate: backgroundImage === null ? "not loaded" : "loaded",
+        searchState: searchState,
+        openState: openState,
+        preparationState: preparationState,
+        undoState: undoSync_stateName(undoState),
+        strokes: signatureStrokes.length,
+        hotSpots: { cancel: cancelButton, retry: retryButton, confirm: confirmButton }
+    };
+
+    logMessage("-- diagnostics " + JSON.stringify(info));
+    return info;
 }
 
 function onMainWindowBeforeUnload() {
@@ -483,11 +571,21 @@ function connectionUrl(evt) {
 function onOpen(evt) {
     var url = connectionUrl(evt);
     setStatus(url === null ? "ActiveX loaded" : "Connected to " + url, "success");
+    logMessage("-- connection open");
+
+    flushPendingMessages();
 }
 
 function onClose(evt) {
     var url = connectionUrl(evt);
     setStatus(url === null ? "ActiveX unloaded" : "Disconnected from " + url, "fail");
+    logMessage("!! connection closed");
+
+    pendingMessages = [];
+    padState = padStates.closed;
+    resetPipelineState();
+    undoResyncPending = false;
+    undoSync_finish();
 }
 
 function onError(evt) {
@@ -929,19 +1027,27 @@ function displaySetTextMessage(rect, text) {
 // ---------------------------------------------------------------------------
 
 function getSignature() {
+    if (statusElement === null) {
+        statusElement = byId("status");
+    }
+
+    // resolve the canvas again: it may have been added to the DOM after load
     sigcanvas = byId("sigCanvas");
     if (sigcanvas === null) {
-        logMessage("!! sigCanvas element not found");
+        setStatus("sigCanvas element not found", "fail");
+        logMessage("!! sigCanvas element not found, cannot capture a signature");
         return;
     }
-    if (signoPADAPIWeb === null) {
-        logMessage("!! not connected to the signotec service");
+
+    // connect on demand, in case onMainWindowLoad() never ran
+    if (!connectToService()) {
         return;
     }
 
     resetSignature();
     resetPipelineState();
 
+    logMessage("-- searching for pads (" + padConnectionType + ")");
     api_search_for_pads();
 }
 
@@ -1010,7 +1116,8 @@ function onGetInfoResponse(obj) {
 
     var profile = getPadProfile();
     if (profile === null) {
-        logMessage("!! unsupported pad type " + padType);
+        logMessage("!! unsupported pad type: TOKEN_PARAM_TYPE=" + obj.TOKEN_PARAM_TYPE +
+            " (parsed as " + padType + "). Add it to getPadProfile() to support it.");
         resetPipelineState();
         close_pad();
         return;
