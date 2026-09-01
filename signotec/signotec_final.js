@@ -1,133 +1,74 @@
-$("#verify").hide();
-$("#certificateName").hide();
-$("#barCode").hide();
-$("#signNow").hide();
+/*
+ * signotec signature pad integration (Omega / Sigma / Gamma / Delta / Alpha)
+ * ---------------------------------------------------------------------------
+ * Talks to the local signotec WebSocket service using the JSON TOKEN_CMD_*
+ * protocol, in API mode only.
+ *
+ * The pad draws three touch buttons on its own screen:
+ *
+ *   Cancel   -> abort signing
+ *   Retry    -> UNDO THE LAST STROKE (originally: clear everything)
+ *   Confirm  -> accept the signature
+ *
+ * Undo removes the last stroke from the local preview AND repaints the pad's
+ * own screen so both stay in sync. See "Undo -> pad screen sync" below for why
+ * the repaint is done through an image store rather than by writing to the
+ * live display.
+ *
+ * The final image is taken from sigCanvas, never from the pad's internal
+ * buffer: the pad's buffer would still contain strokes that were undone.
+ */
 
-var signoPADAPIWeb = null;
+/* global $ */
 
-var searchStates = {
-    setPadType: 0,
-    search: 1,
-    getInfo: 2,
-    getVersion: 3
-};
-var searchState = searchStates.setPadType;
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
 
-var openStates = {
-    openPad: 0,
-    setColor: 1,
-    getDisplayWidth: 2,
-    getDisplayHeight: 3,
-    getResolution: 4
-};
-var openState = openStates.openPad;
+var wsUri = "wss://local.signotecwebsocket.de:49494";
 
-var preparationStates = {
-    setDisplayRotation: 0,
-    getDisplayRotation: 1,
-    setBackgroundTarget: 2,
-    setBackgroundImage: 3,
-    setCancelButton: 4,
-    setRetryButton: 5,
-    setConfirmButton: 6,
-    setSignRect: 7,
-    setFieldName: 8,
-    setCustomText: 9,
-    setForegroundTarget: 10,
-    switchBuffers: 11,
-    startSignature: 12
-};
-var preparationState = preparationStates.setDisplayRotation;
+// pad subset passed to TOKEN_CMD_API_DEVICE_SET_COM_PORT
+var padConnectionType = "HID";
 
-var padStates = {
-    closed: 0,
-    opened: 1
-};
-var padState = padStates.closed;
+// index of the pad to use when several are connected
+var padIndex = 0;
 
-var padModes = {
-    Default: 0,
-    API: 1
-};
-var padMode = padModes.Default;
-
-// ---------------------------------------------------------------------
-// Undo-to-pad synchronisation
-// ---------------------------------------------------------------------
-// Why the previous two attempts blanked the screen and closed the session:
-//
-// onMessage() dispatches EVERY response to EVERY handler (see the big
-// fall-through switch at the bottom of this file). So the
-// TOKEN_CMD_API_DISPLAY_SET_TARGET / TOKEN_CMD_API_DISPLAY_SET_IMAGE
-// responses that belonged to the Undo redraw were ALSO delivered to
-// api_signature_start_responses(). Its generic SET_IMAGE branch does,
-// unconditionally:
-//
-//     preparationState = preparationStates.setCancelButton;
-//     api_signature_start();
-//
-// i.e. it re-enters the one-time pad PREPARATION sequence in the middle of
-// a live session -- re-adding hot spots, re-setting the sign rect, and
-// finally calling SIGNATURE_START again. That cascade fails and every
-// failure branch in there calls close_pad(). Blank screen, then the
-// session closes. Exactly the observed symptom, and nothing to do with
-// the firmware rejecting SET_IMAGE.
-//
-// Two fixes, both applied below:
-//   1. onMessage() now gives the Undo state machine FIRST refusal on every
-//      response, and returns immediately if it consumed one. No Undo
-//      response can ever reach the preparation handlers again.
-//   2. Nothing in the Undo path calls close_pad(). On any error it logs the
-//      return code + description and gives up on the screen sync only --
-//      the signing session stays alive.
-//
-// The repaint itself never writes a bitmap to the LIVE display. It uses the
-// same store mechanism the preparation sequence already uses successfully:
-//   SET_TARGET(1)  -> draw into store 1 (off-screen, safe)
-//   SET_IMAGE      -> composite (template + remaining strokes) into store 1
-//   SET_TEXT_IN_RECT x2 -> the two labels, into store 1
-//   SET_TARGET(0)  -> back to the live display
-//   SET_IMAGE_FROM_STORE(1) -> firmware-native blit, no payload
-// preceded by TOKEN_CMD_API_SIGNATURE_RETRY, which is the one command
-// confirmed safe mid-session and which drops the strokes the firmware has
-// captured so far.
-
-// master switch: set to false to fall back to local-only Undo (the pad's
-// own screen then keeps showing the undone stroke until Confirm, but the
-// saved image stays correct because it is built from sigCanvas).
-var UNDO_SYNC_TO_PAD = true;
-// send SIGNATURE_RETRY before the repaint (true) or after it (false).
-// If the screen ends up blank, try flipping this to false.
-var UNDO_RETRY_FIRST = true;
-// image store used by the preparation sequence (SET_IMAGE_FROM_STORE).
-var UNDO_STORE_ID = 1;
-// give up on a step if the pad does not answer.
-var UNDO_TIMEOUT_MS = 8000;
-// pen width the pad itself draws with (TOKEN_CMD_API_DISPLAY_CONFIG_PEN),
-// used so the composite matches what the firmware drew.
+// pen width the pad itself draws with (TOKEN_CMD_API_DISPLAY_CONFIG_PEN)
 var PAD_PEN_WIDTH = 3;
 
-var undoStates = {
-    idle: 0,
-    retry: 1,
-    setStoreTarget: 2,
-    setStoreImage: 3,
-    setFieldText: 4,
-    setCustomText: 5,
-    setDisplayTarget: 6,
-    blitStore: 7
-};
-var undoState = undoStates.idle;
-var undoSeq = [];
-var undoSeqIndex = -1;
-var undoCompositeImage = null;
-var undoTimeoutId = null;
-var undoResyncPending = false;
+// pen width used for the on-screen preview
+var PREVIEW_PEN_WIDTH = 5;
 
-// texts drawn by the preparation sequence; re-applied after Undo so the
-// repainted screen is identical to the original one.
+// labels drawn onto the pad during preparation, re-applied after an Undo
 var PAD_FIELD_NAME_TEXT = "Signature 1";
 var PAD_CUSTOM_TEXT = "Please sign!";
+
+// --- Undo -> pad screen sync -----------------------------------------------
+//
+// Set to false for local-only Undo. The pad's own screen then keeps showing
+// the undone stroke until Confirm, but the saved image is still correct
+// because it is built from sigCanvas.
+var UNDO_SYNC_TO_PAD = true;
+
+// Send SIGNATURE_RETRY before the repaint (true) or after it (false).
+// If the pad screen ends up blank, try flipping this to false.
+var UNDO_RETRY_FIRST = true;
+
+// Image store the preparation sequence renders into and blits from.
+var UNDO_STORE_ID = 1;
+
+// Give up on a step if the pad does not answer within this long.
+var UNDO_TIMEOUT_MS = 8000;
+
+var PEN_COLOR_GREY = "#7F7F7F";
+var PEN_COLOR_RED = "#FF0000";
+var PEN_COLOR_GREEN = "#008000";
+var PEN_COLOR_BLUE = "#0000FF";
+var PEN_COLOR_BLACK = "#000000";
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
 
 var padTypes = {
     sigmaUSB: 1,
@@ -142,8 +83,7 @@ var padTypes = {
     alphaUSB: 31,
     alphaSerial: 32,
     alphaIP: 33
-}
-var padType = 0;
+};
 
 var deviceCapabilities = {
     HasColorDisplay: 0x00000001,
@@ -165,65 +105,357 @@ var deviceCapabilities = {
     HasNFCReader: 0x00010000
 };
 
-var docHashes = {
-    kSha1: 0,
-    kSha256: 1
+var searchStates = {
+    setPadType: 0,
+    search: 1,
+    getInfo: 2,
+    getVersion: 3
 };
 
+var openStates = {
+    openPad: 0,
+    setColor: 1,
+    getDisplayWidth: 2,
+    getDisplayHeight: 3,
+    getResolution: 4
+};
+
+var preparationStates = {
+    setDisplayRotation: 0,
+    getDisplayRotation: 1,
+    setBackgroundTarget: 2,
+    setBackgroundImage: 3,
+    setCancelButton: 4,
+    setRetryButton: 5,
+    setConfirmButton: 6,
+    setSignRect: 7,
+    setFieldName: 8,
+    setCustomText: 9,
+    setForegroundTarget: 10,
+    switchBuffers: 11,
+    startSignature: 12
+};
+
+var padStates = {
+    closed: 0,
+    opened: 1
+};
+
+var undoStates = {
+    idle: 0,
+    retry: 1,
+    setStoreTarget: 2,
+    setStoreImage: 3,
+    setFieldText: 4,
+    setCustomText: 5,
+    setDisplayTarget: 6,
+    blitStore: 7
+};
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+
+var signoPADAPIWeb = null;
+
+var searchState = searchStates.setPadType;
+var openState = openStates.openPad;
+var preparationState = preparationStates.setDisplayRotation;
+var padState = padStates.closed;
+
+var padType = 0;
+var supportsRSA = false;
+
+// hot spot ids returned by TOKEN_CMD_API_SENSOR_ADD_HOT_SPOT
 var cancelButton = -1;
 var retryButton = -1;
 var confirmButton = -1;
+
+// hot spot layout, computed while the buttons are added
 var buttonDiff = 0;
 var buttonLeft = 0;
-var buttonTop = 0;
-var buttonSize = 0;
-var backgroundImage;
+
+// pristine per-model template (border / title / button graphics), base64 PNG
+// without the "data:image/png;base64," prefix. Undo always composites onto
+// this original, never onto a previous composite, so nothing accumulates.
+var backgroundImage = null;
+
+// pad display <-> signature coordinate scaling
 var scaleFactorX = 1.0;
 var scaleFactorY = 1.0;
 
-var supportsRSA = false;
-var field_name = "Signature 1";
-var custom_text = "Please sign!";
-var encryption = "TRUE";
-var docHash = docHashes.kSha256;
-var encryption_cert = "MIICqTCCAZGgAwIBAgIBATANBgkqhkiG9w0BAQUFADAYMRYwFAYDVQQKEw1EZW1vIHNpZ25vdGVjMB4XDTE1MTAwNzA5NDc1MFoXDTI1MTAwNDA5NDc1MFowGDEWMBQGA1UEChMNRGVtbyBzaWdub3RlYzCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAOFFpsZexYW28Neznn26Bp9NVCJywFFj1QYXg3DDsaSyr6ubuqXKSC4jkenIGBnom/zKPxwPDtNXuy+nyDYFXYNn87TUdh/51CCr3uk9kR9hvRIzBKwkOx0DGLdCoSGAKDOPHwx1rE0m/SOqYOQh6XFjlybw+KzDZcPvhf2Fq/IFNXHpk8m0YHMAReW8q34CYjk9ZtcIlrcYGTikQherOtYM8CaEUPDd6vdJgosGWEnDeNXDCAIWTFc5ECJm9Hh7a47eF3BG5Pjl1QfOSA8lQBV5eTjQc1n1rWCWULt143nIbN5yCFrn0D8W6+eKJV5urETxWUQ208iqgeU1bIgKSEUCAwEAATANBgkqhkiG9w0BAQUFAAOCAQEAt2ax8iwLFoOmlAOZTQcRQtjxseQAhgOTYL/vEP14rPZhF1/gkI9ZzhESdkqR8mHIIl7FnfBg9A2v9ZccC7YgRb4bCXNzv6TIEyz4EYXNkIq8EaaQpvsX4+A5jKIP0PRNZUaLJaDRcQZudd6FMyHxrHtCUTEvORzrgGtRnhBDhAMiSDmQ958t8RhET6HL8C7EnL7f8XBMMFR5sDC60iCu/HeIUkCnx/a2waZ13QvhEIeUBmTRi9gEjZEsGd1iZmgf8OapTjefZMXlbl7CJBymKPJgXFe5mD9/yEMFKNRy5Xfl3cB2gJka4wct6PSIzcQVPaCts6I0V9NfEikXy1bpSA==";
+// One entry per stroke: { color, points: [{x, y}, ...] } in raw device
+// coordinates. This is the source of truth for Undo and for every redraw.
+var signatureStrokes = [];
+var currentStroke = null;
 
-var padConnectionType;
+// data URL of the last confirmed signature, also exposed as
+// window.lastSignatureImage for the surrounding application.
+var lastSignatureImage = null;
 
-var wsUri = "wss://local.signotecwebsocket.de:49494";
-//debugger
-var state = document.getElementById("status");
-var sigcanvas = document.getElementById("sigCanvas");
+// Undo -> pad screen sync
+var undoState = undoStates.idle;
+var undoSequence = [];
+var undoSequenceIndex = -1;
+var undoCompositeImage = null;
+var undoTimeoutId = null;
+var undoResyncPending = false;
 
-var padIndex = 0;
+var statusElement = null;
+var sigcanvas = null;
 
-const PEN_COLOR_GREY = "#7f7f7f";
-const PEN_COLOR_RED = "#ff0000";
-const PEN_COLOR_GREEN = "#008000";
-const PEN_COLOR_BLUE = "#0000ff";
-const PEN_COLOR_BLACK = "#000000";
+// ---------------------------------------------------------------------------
+// Per-model geometry
+// ---------------------------------------------------------------------------
+//
+// Single source of truth: the background image element id, the hot spot size,
+// the signature rectangle, and the two text rectangles. Used by both the
+// one-time preparation sequence and the Undo repaint, so the two can never
+// drift apart.
 
-const MODE_LIST_DEFAULT = "Default";
-const MODE_LIST_API = "API";
+function getPadProfile() {
+    switch (padType) {
+        case padTypes.sigmaUSB:
+        case padTypes.sigmaSerial:
+            return {
+                imageId: "Sigma",
+                buttonSize: 36,
+                buttonTop: 2,
+                signRectTop: 40,
+                fieldNameRect: { left: 15, top: 43, width: 285, height: 18 },
+                customTextRect: { left: 15, top: 110, width: 265, height: 18 }
+            };
 
-if (window.WebSocket === undefined) {
-    state.innerHTML = "sockets not supported " + evt.target.url;
-    state.className = "fail";
-}
-else {
-    if (typeof String.prototype.startsWith != "function") {
-        String.prototype.startsWith = function (str) {
-            return this.indexOf(str) == 0;
-        };
+        case padTypes.omegaUSB:
+        case padTypes.omegaSerial:
+            return {
+                imageId: "Omega",
+                buttonSize: 48,
+                buttonTop: 4,
+                signRectTop: 56,
+                fieldNameRect: { left: 40, top: 86, width: 570, height: 40 },
+                customTextRect: { left: 40, top: 350, width: 520, height: 40 }
+            };
+
+        case padTypes.gammaUSB:
+        case padTypes.gammaSerial:
+            return {
+                imageId: "Gamma",
+                buttonSize: 48,
+                buttonTop: 4,
+                signRectTop: 56,
+                fieldNameRect: { left: 40, top: 86, width: 720, height: 40 },
+                customTextRect: { left: 40, top: 350, width: 670, height: 40 }
+            };
+
+        case padTypes.deltaUSB:
+        case padTypes.deltaSerial:
+        case padTypes.deltaIP:
+            return {
+                imageId: "Delta",
+                buttonSize: 48,
+                buttonTop: 4,
+                signRectTop: 56,
+                fieldNameRect: { left: 40, top: 86, width: 1200, height: 50 },
+                customTextRect: { left: 40, top: 640, width: 670, height: 50 }
+            };
+
+        case padTypes.alphaUSB:
+        case padTypes.alphaSerial:
+        case padTypes.alphaIP:
+            return {
+                imageId: "Alpha",
+                buttonSize: 80,
+                buttonTop: 10,
+                signRectTop: 100,
+                fieldNameRect: { left: 20, top: 120, width: 730, height: 30 },
+                customTextRect: { left: 20, top: 1316, width: 730, height: 30 }
+            };
+
+        default:
+            return null;
     }
 }
 
-function onMainWindowLoad() {
-    //debugger
+function getReadableType(type) {
+    switch (type) {
+        case padTypes.sigmaUSB: return "Sigma USB";
+        case padTypes.sigmaSerial: return "Sigma serial";
+        case padTypes.omegaUSB: return "Omega USB";
+        case padTypes.omegaSerial: return "Omega serial";
+        case padTypes.gammaUSB: return "Gamma USB";
+        case padTypes.gammaSerial: return "Gamma serial";
+        case padTypes.deltaUSB: return "Delta USB";
+        case padTypes.deltaSerial: return "Delta serial";
+        case padTypes.deltaIP: return "Delta IP";
+        case padTypes.alphaUSB: return "Alpha USB";
+        case padTypes.alphaSerial: return "Alpha serial";
+        case padTypes.alphaIP: return "Alpha IP";
+        default: return "Unknown (" + type + ")";
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Small DOM helpers
+// ---------------------------------------------------------------------------
+//
+// Every lookup is guarded: this script runs against several pages and a
+// missing optional element must never abort a signing session.
+
+function byId(id) {
     try {
+        return document.getElementById(id);
+    } catch (e) {
+        return null;
+    }
+}
+
+function setStatus(text, className) {
+    if (statusElement === null) {
+        statusElement = byId("status");
+    }
+    if (statusElement === null) {
+        return;
+    }
+    statusElement.innerHTML = text;
+    statusElement.className = className;
+}
+
+function setText(id, text) {
+    var el = byId(id);
+    if (el !== null) {
+        el.innerHTML = text;
+    }
+}
+
+function getSelectedPenColor() {
+    var select = byId("signaturePenColorSelect");
+    var value = (select === null) ? "" : String(select.value).toUpperCase();
+
+    switch (value) {
+        case PEN_COLOR_GREY:
+        case PEN_COLOR_RED:
+        case PEN_COLOR_GREEN:
+        case PEN_COLOR_BLUE:
+        case PEN_COLOR_BLACK:
+            return value;
+        default:
+            return PEN_COLOR_RED;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Logging
+// ---------------------------------------------------------------------------
+//
+// Appends to <ul id="log"> and mirrors to the browser console. The previous
+// version assigned to log.innerHTML on every message, so only the last line
+// ever survived, which is why earlier failures could not be diagnosed.
+//
+// Line prefixes:  >> sent   << received   -- progress   !! error
+
+var logLineCount = 0;
+
+function shortenForLog(msg) {
+    try {
+        // collapse the very large base64 image payloads
+        return String(msg).replace(
+            /("TOKEN_PARAM_(?:BITMAP|IMAGE|FILE)":")([^"]{80,})(")/g,
+            function (match, head, body, tail) {
+                return head + body.substring(0, 40) +
+                    "...[" + body.length + " chars]..." + tail;
+            });
+    } catch (e) {
+        return String(msg);
+    }
+}
+
+function logMessage(msg) {
+    var line = shortenForLog(msg);
+
+    try {
+        console.log("[signotec] " + line);
+    } catch (e) { /* no console */ }
+
+    try {
+        var list = byId("log");
+        if (list === null) {
+            return;
+        }
+        logLineCount++;
+        var item = document.createElement("li");
+        item.textContent = "[" + logLineCount + "] " + line;
+        list.appendChild(item);
+        list.scrollTop = list.scrollHeight;
+    } catch (e) { /* logging must never break signing */ }
+}
+
+/**
+ * Reports a failed response with the exact return code and description, so a
+ * failure is visible in #log instead of vanishing silently.
+ */
+function logResponseError(what, obj) {
+    logMessage("!! " + what +
+        " | TOKEN_CMD_ORIGIN=" + obj.TOKEN_CMD_ORIGIN +
+        " | TOKEN_PARAM_RETURN_CODE=" + obj.TOKEN_PARAM_RETURN_CODE +
+        " | TOKEN_PARAM_ERROR_DESCRIPTION=" + obj.TOKEN_PARAM_ERROR_DESCRIPTION);
+}
+
+function sendMessage(message) {
+    logMessage(">> " + message);
+    try {
+        signoPADAPIWeb.send(message);
+        return true;
+    } catch (e) {
+        logMessage("!! send failed: " + e);
+        return false;
+    }
+}
+
+/**
+ * Shared guard for every response handler: logs and closes the pad when the
+ * pad reports a failure. Returns true when the caller should stop.
+ */
+function failed(obj, what) {
+    if (obj.TOKEN_PARAM_RETURN_CODE >= 0) {
+        return false;
+    }
+    logResponseError(what, obj);
+    resetPipelineState();
+    close_pad();
+    return true;
+}
+
+function resetPipelineState() {
+    searchState = searchStates.setPadType;
+    openState = openStates.openPad;
+    preparationState = preparationStates.setDisplayRotation;
+}
+
+// ---------------------------------------------------------------------------
+// Page lifecycle
+// ---------------------------------------------------------------------------
+
+function onMainWindowLoad() {
+    statusElement = byId("status");
+    sigcanvas = byId("sigCanvas");
+
+    if (sigcanvas === null) {
+        setStatus("sigCanvas element not found", "fail");
+        logMessage("!! sigCanvas element not found");
+        return;
+    }
+
+    if (typeof window !== "undefined" && window.WebSocket === undefined) {
+        setStatus("WebSockets are not supported by this browser", "fail");
+        logMessage("!! WebSockets are not supported by this browser");
+        return;
+    }
+
+    try {
+        // legacy Internet Explorer path
         signoPADAPIWeb = new ActiveXObject("signotec.STPadActiveXServer");
-        state.className = "success";
-        state.innerHTML = "ActiveX loaded";
+        setStatus("ActiveX loaded", "success");
     } catch (e) {
         signoPADAPIWeb = new WebSocket(wsUri);
         signoPADAPIWeb.onopen = onOpen;
@@ -231,776 +463,188 @@ function onMainWindowLoad() {
         signoPADAPIWeb.onerror = onError;
     }
 
-    // Common for ActiveX and WebSocket
     signoPADAPIWeb.onmessage = onMessage;
 
     clearSignature();
     check_boxes_selectedElements_onchange();
-    //ModeListName_onchange();
 }
 
 function onMainWindowBeforeUnload() {
     close_pad();
 }
 
+function connectionUrl(evt) {
+    if (!evt || evt.target === undefined || evt.target.url === undefined) {
+        return null;
+    }
+    return evt.target.url;
+}
+
 function onOpen(evt) {
-    state.className = "success";
-    if ((evt.target === undefined) || (evt.target.url === undefined)) {
-        state.innerHTML = "ActiveX loaded";
-    }
-    else {
-        state.innerHTML = "Connected to " + evt.target.url;
-    }
+    var url = connectionUrl(evt);
+    setStatus(url === null ? "ActiveX loaded" : "Connected to " + url, "success");
 }
 
 function onClose(evt) {
-    //debugger
-    state.className = "fail";
-    if ((evt.target === undefined) || (evt.target.url === undefined)) {
-        state.innerHTML = "ActiveX unloaded";
-    }
-    else {
-        state.innerHTML = "Disconnected from " + evt.target.url;
-    }
+    var url = connectionUrl(evt);
+    setStatus(url === null ? "ActiveX unloaded" : "Disconnected from " + url, "fail");
 }
 
 function onError(evt) {
-    state.className = "fail";
-    if ((evt.target === undefined) || (evt.target.url === undefined)) {
-        state.innerHTML = "Communication error";
-    }
-    else {
-        state.innerHTML = "Communication error " + evt.target.url;
-    }
+    var url = connectionUrl(evt);
+    setStatus(url === null ? "Communication error" : "Communication error " + url, "fail");
 }
 
-// Cumulative log. The old version overwrote #log on every message
-// (log.innerHTML = ...), so only the LAST line ever survived -- which is
-// exactly why the previous crash could never be diagnosed. Now every sent
-// and received message is appended, long base64 payloads are shortened so
-// the DOM stays usable, and everything is mirrored to the browser console.
-var logLineCount = 0;
-
-function shortenForLog(msg) {
-    try {
-        // collapse the huge base64 image payloads
-        return String(msg).replace(
-            /("TOKEN_PARAM_(?:BITMAP|IMAGE|FILE)":")([^"]{80,})(")/g,
-            function (m, head, body, tail) {
-                return head + body.substring(0, 40) + "...[" + body.length + " chars]..." + tail;
-            });
-    } catch (e) {
-        return msg;
-    }
-}
-
-function logMessage(msg) {
-    var line = shortenForLog(msg);
-    try {
-        console.log("[signotec] " + line);
-    } catch (e) { }
-    try {
-        var el = document.getElementById("log");
-        if (!el) {
-            return;
-        }
-        logLineCount++;
-        var li = document.createElement("li");
-        li.textContent = "[" + logLineCount + "] " + line;
-        el.appendChild(li);
-        el.scrollTop = el.scrollHeight;
-    } catch (e) { }
-}
+// ---------------------------------------------------------------------------
+// Signature capture: drawing
+// ---------------------------------------------------------------------------
 
 /**
-* Logs the return code + error description of any response, so a failure
-* shows up in #log with the exact TOKEN_PARAM_RETURN_CODE /
-* TOKEN_PARAM_ERROR_DESCRIPTION instead of silently vanishing.
-*/
-function logResponseError(prefix, obj) {
-    logMessage("!! " + prefix +
-        " | TOKEN_CMD_ORIGIN=" + obj.TOKEN_CMD_ORIGIN +
-        " | TOKEN_PARAM_RETURN_CODE=" + obj.TOKEN_PARAM_RETURN_CODE +
-        " | TOKEN_PARAM_ERROR_DESCRIPTION=" + obj.TOKEN_PARAM_ERROR_DESCRIPTION);
-}
-
-/**
-* Draws a stroke start point into the canvas
-*/
-let allcanvass = [];
-// per-stroke point storage (raw device coords), used by Undo
-let signatureStrokes = [];
-let currentStrokeRef = null;
-// the pristine per-model template (border/title/buttons), cached once;
-// backgroundImage itself gets overwritten with template+strokes composites
-let originalBackgroundImage = null;
-function drawStrokeStartPoint(canvasContext, softCoordX, softCoordY) {
-    // open new stroke's path
-    canvasContext.beginPath();
-    canvasContext.arc(softCoordX, softCoordY, 1, 0, 2 * Math.PI, true);
-    canvasContext.fill();
-    canvasContext.stroke();
-    canvasContext.moveTo(softCoordX, softCoordY);
-
-    
-}
-
-/**
-* Draws a stroke point into the canvas
-*/
-function drawStrokePoint(canvasContext, softCoordX, softCoordY) {
-    // continue after start or not start point
-    canvasContext.lineTo(softCoordX, softCoordY);
-    canvasContext.stroke();
-    allcanvass.push(canvasContext);
-   
-}
-
-// disconnect send begin
-// TOKEN_CMD_DISCONNECT
-function disconnect_send(index) {
-   //debugger
-    var msg = "The pad (index: " + index + ") has been disconnected.";
-    ////alert(msg);
-
-    searchState = searchStates.setPadType;
-    openState = openStates.openPad;
-    preparationState = preparationStates.setDisplayRotation;
-    padState = padStates.closed;
-}
-// disconnect send end
-
-// signature point send begin
-//TOKEN_CMD_SIGNATURE_POINT
-function getSelectedPenColor() {
-    switch (document.getElementById("signaturePenColorSelect").value) {
-        case PEN_COLOR_GREY:
-            return "#7F7F7F";
-        case PEN_COLOR_RED:
-            return "#FF0000";
-        case PEN_COLOR_GREEN:
-            return "#008000";
-        case PEN_COLOR_BLUE:
-            return "#0000FF";
-        case PEN_COLOR_BLACK:
-            return "#000000";
-        default:
-            return "#FF0000";
+ * Draws one stroke as a single path. Called for the preview redraw and for
+ * the composite pushed back to the pad.
+ */
+function drawStroke(ctx, stroke, penWidth) {
+    var points = stroke.points;
+    if (!points || points.length === 0) {
+        return;
     }
-}
 
-function signature_point_send(x, y, p) {
-    var ctx = sigcanvas.getContext("2d");
-
-    ctx.fillStyle = "#fff";
-    ctx.strokeStyle = getSelectedPenColor();
-    ctx.lineWidth = 5;
+    ctx.lineWidth = penWidth;
     ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    ctx.strokeStyle = stroke.color;
+    ctx.fillStyle = stroke.color;
 
-    var softX = x * scaleFactorX;
-    var softY = y * scaleFactorY;
+    var firstX = points[0].x * scaleFactorX;
+    var firstY = points[0].y * scaleFactorY;
 
-    if (p == 0) {
-        // new stroke: remember raw device coords so it can be redrawn
-        // later (both for the local preview and for the composite we
-        // push back to the pad after an Undo)
-        currentStrokeRef = {
-            color: ctx.strokeStyle,
-            points: [{ x: x, y: y }]
-        };
-        signatureStrokes.push(currentStrokeRef);
-
-        drawStrokeStartPoint(ctx, softX, softY);
+    if (points.length === 1) {
+        // a tap: render the single point as a dot
+        ctx.beginPath();
+        ctx.arc(firstX, firstY, penWidth / 2, 0, 2 * Math.PI, true);
+        ctx.fill();
+        return;
     }
-    else {
-        if (currentStrokeRef === null) {
-            currentStrokeRef = { color: ctx.strokeStyle, points: [] };
-            signatureStrokes.push(currentStrokeRef);
-        }
-        currentStrokeRef.points.push({ x: x, y: y });
 
-        drawStrokePoint(ctx, softX, softY);
+    ctx.beginPath();
+    ctx.moveTo(firstX, firstY);
+    for (var i = 1; i < points.length; i++) {
+        ctx.lineTo(points[i].x * scaleFactorX, points[i].y * scaleFactorY);
+    }
+    ctx.stroke();
+}
+
+function drawStrokes(ctx, penWidth) {
+    for (var i = 0; i < signatureStrokes.length; i++) {
+        drawStroke(ctx, signatureStrokes[i], penWidth);
     }
 }
 
 /**
-* Redraws the local preview canvas (sigcanvas) from signatureStrokes.
-* Used right after Undo removes the last stroke.
-*/
-function redrawSignatureCanvas() {
+ * Draws the segment that was just added to the current stroke. Each segment
+ * gets its own path, so cost stays constant per point instead of growing with
+ * the length of the stroke.
+ */
+function drawLastSegment(ctx, stroke) {
+    var points = stroke.points;
+
+    ctx.lineWidth = PREVIEW_PEN_WIDTH;
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    ctx.strokeStyle = stroke.color;
+    ctx.fillStyle = stroke.color;
+
+    if (points.length === 1) {
+        ctx.beginPath();
+        ctx.arc(points[0].x * scaleFactorX, points[0].y * scaleFactorY,
+                PREVIEW_PEN_WIDTH / 2, 0, 2 * Math.PI, true);
+        ctx.fill();
+        return;
+    }
+
+    var from = points[points.length - 2];
+    var to = points[points.length - 1];
+
+    ctx.beginPath();
+    ctx.moveTo(from.x * scaleFactorX, from.y * scaleFactorY);
+    ctx.lineTo(to.x * scaleFactorX, to.y * scaleFactorY);
+    ctx.stroke();
+}
+
+function clearCanvas() {
+    if (sigcanvas === null) {
+        return;
+    }
     var ctx = sigcanvas.getContext("2d");
     ctx.clearRect(0, 0, sigcanvas.width, sigcanvas.height);
-    drawStrokesOnContext(ctx, 5);
 }
-// signature point send end
 
-// signature retry send begin
-// TOKEN_CMD_SIGNATURE_RETRY and TOKEN_CMD_API_SIGNATURE_RETRY
-function signature_retry_send() {
-    var message;
-    if (padMode == padModes.Default) {
-        // default mode
-        message = '{ "TOKEN_TYPE":"TOKEN_TYPE_REQUEST", "TOKEN_CMD":"TOKEN_CMD_SIGNATURE_RETRY" }';
-    }
-    else if (padMode == padModes.API) {
-        // API mode
-        message = '{ "TOKEN_TYPE":"TOKEN_TYPE_REQUEST", "TOKEN_CMD":"TOKEN_CMD_API_SIGNATURE_RETRY" }';
-    }
-    else {
-        ////alert("invalid padMode");
+function redrawSignatureCanvas() {
+    if (sigcanvas === null) {
         return;
     }
-    signoPADAPIWeb.send(message);
-    logMessage(message);
+    clearCanvas();
+    drawStrokes(sigcanvas.getContext("2d"), PREVIEW_PEN_WIDTH);
 }
 
-function signature_retry_response(obj) {
-    // retry of the signature from default and api pad
-    if ((obj.TOKEN_CMD_ORIGIN == "TOKEN_CMD_SIGNATURE_RETRY") || (obj.TOKEN_CMD_ORIGIN == "TOKEN_CMD_API_SIGNATURE_RETRY")) {
-        //check the return code
-        var ret = obj.TOKEN_PARAM_RETURN_CODE;
-        if (ret < 0) {
-            logResponseError("signature retry failed", obj);
-            close_pad();
-            return;
-        }
-
-        // A Retry that belongs to the Undo sequence never gets here: it is
-        // consumed by undoSync_handleResponse() in onMessage() before any
-        // handler runs. So reaching this point always means a real full
-        // clear was requested.
-        var ctx = sigcanvas.getContext("2d");
-        ctx.clearRect(0, 0, sigcanvas.width, sigcanvas.height);
-        signatureStrokes = [];
-        currentStrokeRef = null;
-    }
-    else {
-        // do nothing
-    }
+function resetSignature() {
+    signatureStrokes = [];
+    currentStroke = null;
+    clearCanvas();
 }
 
-// signature retry send end
-
-// signature confirm send begin
-// TOKEN_CMD_SIGNATURE_CONFIRM and TOKEN_CMD_API_SIGNATURE_CONFIRM
-function signature_confirm_send() {
-    var message;
-    if (padMode == padModes.Default) {
-        // default mode
-        message = '{ "TOKEN_TYPE":"TOKEN_TYPE_REQUEST", "TOKEN_CMD":"TOKEN_CMD_SIGNATURE_CONFIRM" }';
-    }
-    else if (padMode == padModes.API) {
-        // API mode
-        message = '{ "TOKEN_TYPE":"TOKEN_TYPE_REQUEST", "TOKEN_CMD":"TOKEN_CMD_API_SIGNATURE_CONFIRM" }';
-    }
-    else {
-        //alert("invalid padMode");
+// TOKEN_CMD_SIGNATURE_POINT: one pen sample from the pad.
+// p === 0 marks the first point of a new stroke.
+function signature_point_send(x, y, p) {
+    if (sigcanvas === null) {
         return;
     }
-    signoPADAPIWeb.send(message);
-    logMessage(message);
+
+    if (p === 0 || currentStroke === null) {
+        currentStroke = { color: getSelectedPenColor(), points: [] };
+        signatureStrokes.push(currentStroke);
+    }
+
+    currentStroke.points.push({ x: x, y: y });
+    drawLastSegment(sigcanvas.getContext("2d"), currentStroke);
 }
 
-function signature_confirm_response(obj) {
-    // confirm of the signature from default and api pad
-    if ((obj.TOKEN_CMD_ORIGIN == "TOKEN_CMD_SIGNATURE_CONFIRM") || (obj.TOKEN_CMD_ORIGIN == "TOKEN_CMD_API_SIGNATURE_CONFIRM")) {
-        //check the return code
-        var ret = obj.TOKEN_PARAM_RETURN_CODE;
-        if (ret < 0) {
-            logResponseError("Failed to confirm the signature", obj);
-            close_pad();
-            return;
-        }
-
-        // No legal/biometric SignData needed here (confirmed), so the
-        // final image is taken straight from sigCanvas -- which Undo
-        // already keeps correct -- instead of round-tripping to the pad
-        // for TOKEN_CMD_API_SIGNATURE_SAVE_AS_STREAM_EX /
-        // TOKEN_CMD_API_SIGNATURE_GET_SIGN_DATA (both of which read from
-        // the pad's own internal buffer and would still include any
-        // stroke that was undone).
-        signature_image_from_canvas();
-    }
-    else {
-        // do nothing
-    }
-}
-
-// Builds the final signature PNG straight from sigCanvas.
-function signature_image_from_canvas() {
-    var imgData = sigcanvas.toDataURL("image/png");
-    // imgData ("data:image/png;base64,....") is what the rest of the
-    // app should use as the final signature image.
-
-    $("#signDoc1").click();
-    $("#fa-close2").click();
-
-    close_pad();
-}
-
-// TOKEN_CMD_SIGNATURE_IMAGE and TOKEN_CMD_API_SIGNATURE_SAVE_AS_STREAM_EX
-function signature_image() {
-    var message;
-
-    if (padMode == padModes.Default) {
-        // default mode
-        message = '{ "TOKEN_TYPE":"TOKEN_TYPE_REQUEST", "TOKEN_CMD":"TOKEN_CMD_SIGNATURE_IMAGE' +
-            '", "TOKEN_PARAM_FILE_TYPE":"' + '1' + // PNG
-            '", "TOKEN_PARAM_PEN_WIDTH":"' + '5' +
-            '" }';
-    }
-    else if (padMode == padModes.API) {
-        // API mode
-        message = '{ "TOKEN_TYPE":"TOKEN_TYPE_REQUEST", "TOKEN_CMD":"TOKEN_CMD_API_SIGNATURE_SAVE_AS_STREAM_EX' +
-            '", "TOKEN_PARAM_RESOLUTION":"' + '300' +
-            '", "TOKEN_PARAM_WIDTH":"' + '0' +
-            '", "TOKEN_PARAM_HEIGHT":"' + '0' +
-            '", "TOKEN_PARAM_FILE_TYPE":"' + '1' + // PNG
-            '", "TOKEN_PARAM_PEN_WIDTH":"' + '5' +
-            '", "TOKEN_PARAM_PEN_COLOR":"' + document.getElementById("signaturePenColorSelect").value +
-            '", "TOKEN_PARAM_OPTIONS":"' + '0x1400' +
-            '" }';
-    }
-    else {
-        //alert("invalid padMode");
-        return;
-    }
-    signoPADAPIWeb.send(message);
-    logMessage(message);
-}
-
-function signature_image_response(obj) {
-
-    
-
-    // get the signature image from default and api pad
-    if (obj.TOKEN_CMD_ORIGIN == "TOKEN_CMD_SIGNATURE_IMAGE") {
-        //check the return code
-        var ret = obj.TOKEN_PARAM_RETURN_CODE;
-        if (ret < 0) {
-            logResponseError("Failed to get signature image", obj);
-            close_pad();
-            return;
-        }
-
-        //document.getElementById("Signature_0").src = "data:image/png;base64," + obj.TOKEN_PARAM_FILE;
-
-        signature_sign_data();
-    }
-    else if (obj.TOKEN_CMD_ORIGIN == "TOKEN_CMD_API_SIGNATURE_SAVE_AS_STREAM_EX") {
-        //check the return code
-        var ret = obj.TOKEN_PARAM_RETURN_CODE;
-        if (ret < 0) {
-            logResponseError("Failed to get signature image", obj);
-            close_pad();
-            return;
-        }
-
-        ////debugger;
-        //document.getElementById("Signature_0").src = "data:image/png;base64," + obj.TOKEN_PARAM_IMAGE;
-        var SignImg = obj.TOKEN_PARAM_IMAGE;
-
-$("#signDoc1").click();
-$("#fa-close2").click();
-
-        //Ajax Code.................................................
-       
-    //    var imgData = document.getElementById('sigCanvas').toDataURL();
-
-    //    var selRowId = $("#outBoxGrid").jqGrid('getGridParam', 'selrow');
-    //    var rowdata = $("#outBoxGrid").jqGrid('getRowData', selRowId);
-    //    var PIC_LOCATION = rowdata.PIC_LOCATION;
-
-
-    //    var docid = $("#saderChat").attr("DOC_ID");
-    //    var date = $("#saderChat").attr("DOCDATE");
-    //    //var month = date.split('/')[1];
-    //    //month = month.replace(/^0+/, '');
-
-    //    var formData = new FormData();
-    //    formData.append("docId", docid);
-    //    //formData.append("month", month);
-    //    //formData.append("year", date.split('/')[0]);
-
-    //    formData.append("PIC_LOCATION", PIC_LOCATION);
-    //    formData.append("CALC_TNZ_UNIT_CODE", $("#CALC_TNZ_UNIT_CODE").val());
-    //    var PdfPath = '';
-    //    $.ajax({
-
-    //        url: '../outbox_MOSWADA/someClasses/Handler2.ashx',
-    //        method: "POST",
-    //        data: formData,
-    //        processData: false,
-    //        contentType: false,
-    //        beforeSend: function () {
-
-    //        },
-    //        success: function (data) {
-                
-    //            var filepaths = JSON.parse(data);
-    //            for(var xx=0 ; xx<filepaths.length;xx++)
-    //            {
-    //                if(filepaths[xx].endsWith(".pdf"))
-    //                {
-    //                    PdfPath = filepaths[xx];
-
-    //                }
-    //            }
-    //           // PdfPath = filepaths[0];
-    //            PdfPath = PdfPath.replace(/\\/g, "**")
-
-    //            //debugger
-    //            //var psw = "syncfusion";
-    //            //$.ajax({
-    //            //    type: "POST",
-    //            //    url: "../../verify.asmx/getCertificateName",
-    //            //    data: "{'certPassword':'" + psw + "'}",
-    //            //    contentType: "application/json",
-    //            //    datatype: "json",
-    //            //    success: function (data) {
-    //            //        ////alert(data.d);
-                    
-    //            //        if (data.d != null) {
-
-    //            //            //debugger
-
-    //            //            //  $("#signAs").show();
-
-    //            //            //    var selectedSignture = $(this).children("option:selected").text();
-    //            //            ////alert("You have selected the sign  " + selectedSignture);
-
-    //            //            var numPage = 0;
-    //            //            var SignImgPath = imgData;
-    //            //            var signtureName = data.d;
-
-    //            //            $.ajax({
-    //            //                type: "POST",
-    //            //                url: "../../PdfSignNow.asmx/pdfSignNow",
-    //            //                data: "{'PdfPath':'" + PdfPath + "','numPage':'" + numPage + "','psw':'" + psw + "','SignImgPath':'" + SignImgPath + "','signtureName':'" + signtureName + "'}",
-    //            //                contentType: "application/json",
-    //            //                datatype: "json",
-    //            //                success: function (data) {
-    //            //                    //alert(data.d);
-    //            //                    $(".Main_overlay").fadeOut("slow");
-    //            //                },
-    //            //                error: function (error) {
-    //            //                    //alert("Error In Sign");
-    //            //                }
-    //            //            });
-
-
-    //            //        }
-    //            //        else {
-    //            //            //alert("Certificate Authentication Failed1");
-    //            //        }
-    //            //    },
-    //            //    error: function (error) {
-    //            //        //alert("Certificate Authentication Failed");
-    //            //    }
-    //            //});
-
-    //            $.ajax({
-    //                type: "POST",
-    //                url: "../../requestCertificate.asmx/getCertificateName",
-    //                data: "",
-    //                contentType: "application/json",
-    //                datatype: "json",
-    //                success: function (data) {
-               
-    //                    //$("#certificateList").removeData();
-
-    //                    //for (var i = 0; i < data.d.length; i++) {
-    //                    //    $("#certificateList").append(new Option(data.d[i], i + 2));
-    //                    //}
-
-    //                    //$("#certificateName").show();
-
-    //                    //$("#certificateList").change(function () {
-    //                    //var certificateSelected = $(this).children("option:selected").text();
-    //                    //var certificateSelected =  data.d[4];
-    //                    //var certificateSelected =  "localhost";
-    //                    //$("#verify").show();
-    //                    //$("#signNow").show();
-    //                    //$('#barCode').show();
-    //                    //debugger
-                            
-    //                        var numPage = 0;
-    //                        var SignImgPath = imgData;
-    //                        var certificateName = '123';
-    //                        var docId = '123';
-
-    //                        $.ajax({
-    //                            type: "POST",
-    //                            url: "../../PdfSignNow.asmx/pdfSignNow",
-    //                            data: "{'PdfPath':'" + PdfPath + "','numPage':'" + numPage+ "','SignImgPath':'" + SignImgPath + "','certificateName':'" + certificateName + "','docId':'" + docid + "','CALC_TNZ_UNIT_CODE':'" + $("#CALC_TNZ_UNIT_CODE").val() + "','CIV_ID_CARD_NO':'" + $("#sert").val() + "'}",
-    //                            contentType: "application/json",
-    //                            datatype: "json",
-    //                            success: function (data) {
-    //                                //alert(data.d);
-    //                            },
-    //                            error: function (error) {
-    //                                //alert("لم يتم الاعتماد");
-    //                            }
-    //                        });
-
-    //                    //});
-    //                },
-    //                error: function (error) {
-    //                    //alert("Certificate name does not exist !!")
-    //                }
-    //            });
-
-    //        },
-    //        error: function (response) {
-    //          //  //alert("error")
-    //        }
-
-    //    });
-
-
-
-    //    //Done Response Ajax Code.................................................
-
-        signature_sign_data();
-    //}
-    //else {
-    //    // do nothing
-    //}
-}
-}
-
-// TOKEN_CMD_SIGNATURE_SIGN_DATA and TOKEN_CMD_API_SIGNATURE_GET_SIGN_DATA
-function signature_sign_data() {
-    var message;
-    if (padMode == padModes.Default) {
-        // default mode
-        message = '{ "TOKEN_TYPE":"TOKEN_TYPE_REQUEST", "TOKEN_CMD":"TOKEN_CMD_SIGNATURE_SIGN_DATA" }';
-    }
-    else if (padMode == padModes.API) {
-        // API mode
-        message = '{ "TOKEN_TYPE":"TOKEN_TYPE_REQUEST", "TOKEN_CMD":"TOKEN_CMD_API_SIGNATURE_GET_SIGN_DATA" }';
-    }
-    else {
-        //alert("invalid padMode");
-        return;
-    }
-    signoPADAPIWeb.send(message);
-    logMessage(message);
-}
-
-function signature_sign_data_response(obj) {
-    // get the sign data from default and api pad
-    if (obj.TOKEN_CMD_ORIGIN == "TOKEN_CMD_SIGNATURE_SIGN_DATA") {
-        //check the return code
-        var ret = obj.TOKEN_PARAM_RETURN_CODE;
-        if (ret < 0) {
-            logResponseError("Failed to get signature SignData", obj);
-            close_pad();
-            return;
-        }
-
-        if (supportsRSA) {
-            document.getElementById("CertID_0").innerHTML = obj.TOKEN_PARAM_CERT_ID;
-        }
-        else {
-            document.getElementById("CertID_0").innerHTML = "none";
-        }
-
-        //document.getElementById("SignData_0").value = obj.TOKEN_PARAM_SIGNATURE_SIGN_DATA;
-
-        close_pad();
-    }
-    else if (obj.TOKEN_CMD_ORIGIN == "TOKEN_CMD_API_SIGNATURE_GET_SIGN_DATA") {
-        // API mode
-
-        //check the return code
-        var ret = obj.TOKEN_PARAM_RETURN_CODE;
-        if (ret < 0) {
-            logResponseError("Failed to get signature SignData", obj);
-            close_pad();
-            return;
-        }
-
-        
-
-        //document.getElementById("SignData_0").value = obj.TOKEN_PARAM_SIGN_DATA;
-
-        close_pad();
-    }
-    else {
-        // do nothing
-    }
-}
-// signature confirm send end
-
-// signature cancel send begin
-// TOKEN_CMD_SIGNATURE_CANCEL and TOKEN_CMD_API_SIGNATURE_CANCEL
-function signature_cancel_send() {
-
-    $(".Main_overlay").fadeOut("slow");
-    
-    var message;
-    if (padMode == padModes.Default) {
-        // default mode
-        message = '{ "TOKEN_TYPE":"TOKEN_TYPE_REQUEST", "TOKEN_CMD":"TOKEN_CMD_SIGNATURE_CANCEL" }';
-    }
-    else if (padMode == padModes.API) {
-        // API mode
-        message = '{ "TOKEN_TYPE":"TOKEN_TYPE_REQUEST", "TOKEN_CMD":"TOKEN_CMD_API_SIGNATURE_CANCEL", "TOKEN_PARAM_ERASE":"0" }';
-    }
-    else {
-        //alert("invalid padMode");
-        return;
-    }
-    signoPADAPIWeb.send(message);
-    logMessage(message);
-}
-
-function signature_cancel_response(obj) {
-    
-
-    // cancel the signature from default and api pad
-    if ((obj.TOKEN_CMD_ORIGIN == "TOKEN_CMD_SIGNATURE_CANCEL") || (obj.TOKEN_CMD_ORIGIN == "TOKEN_CMD_API_SIGNATURE_CANCEL")) {
-        //check the return code
-        var ret = obj.TOKEN_PARAM_RETURN_CODE;
-        if (ret < 0) {
-            logResponseError("Failed to cancel signature process", obj);
-            close_pad();
-            return;
-        }
-
-        var ctx = sigcanvas.getContext("2d");
-        ctx.clearRect(0, 0, sigcanvas.width, sigcanvas.height);
-
-        close_pad();
-    }
-    else {
-        // do nothing
-    }
-}
-// signature cancel send end
-
-// selection confirm send begin
-// TOKEN_CMD_SELECTION_CONFIRM
-function selection_confirm_send() {
-    if (padMode == padModes.Default) {
-        // default mode
-        var status = '';
-        for (i = 1; i <= document.getElementById("check_boxes_selectedElements").value; i++) {
-            status += 'Feld ' + i + ' = ' + document.getElementById("fieldChecked" + i).checked + '\n';
-        }
-        //alert(status);
-        signature_start();
-    }
-    else if (padMode == padModes.API) {
-        // API mode
-        // do nothing
-    }
-    else {
-        //alert("invalid padMode");
-        return;
-    }
-}
-// selection confirm send end
-
-// selection change send begin
-// TOKEN_CMD_SELECTION_CHANGE
-function selection_change_send(fieldId, fieldChecked) {
-    if (padMode == padModes.Default) {
-        // default mode
-        for (i = 1; i <= document.getElementById("check_boxes_selectedElements").value; i++) {
-            if (document.getElementById("fieldID" + i).value == fieldId) {
-                if (fieldChecked == "TRUE") {
-                    document.getElementById("fieldChecked" + i).checked = true;
-                } else {
-                    document.getElementById("fieldChecked" + i).checked = false;
-                }
-            }
-        }
-    }
-    else if (padMode == padModes.API) {
-        // API mode
-        // do nothing
-    }
-    else {
-        //alert("invalid padMode");
-        return;
-    }
-}
-// selection change send end
-
-// selection cancel send begin
-// TOKEN_CMD_SELECTION_CANCEL
-function selection_cancel_send() {
-    if (padMode == padModes.Default) {
-        // default mode
-        var ctx = sigcanvas.getContext("2d");
-        ctx.clearRect(0, 0, sigcanvas.width, sigcanvas.height);
-
-        close_pad();
-    }
-    else if (padMode == padModes.API) {
-        // API mode
-        // do nothing
-    }
-    else {
-        //alert("invalid padMode");
-        return;
-    }
-}
-// selection cancel send end
-
-// error send begin
-// TOKEN_CMD_ERROR
-function error_send(error_context, return_code, error_description) {
-    var ret = return_code;
-    if (ret < 0) {
-        //alert("Failed to confirm the signature. Reason: " + error_description + ", Context: " + error_context);
-    }
-}
-// error send end
-
-// api sensor hot spot pressed send begin
-// TOKEN_CMD_API_SENSOR_HOT_SPOT_PRESSED
-function api_sensor_hot_spot_pressed_send(button) {
-    switch (button) {
-        // cancel signing process
-        case cancelButton:
-            signature_cancel_send();
-            break;
-
-        // was: full clear (signature_retry_send()).
-        // now: remove only the last stroke, keep the rest, and push the
-        // remaining strokes back onto the pad's own screen.
-        case retryButton:
-            undo_last_stroke_send();
-            break;
-
-        // confirm signing process
-        case confirmButton:
-            signature_confirm_send();
-            break;
-
-        default:
-            //alert("unknown button id: " + button);
-    }
-}
-
-// undo last stroke (bound to the existing Retry hotspot) begin
+// ---------------------------------------------------------------------------
+// Undo the last stroke (bound to the pad's Retry hot spot)
+// ---------------------------------------------------------------------------
 //
-// IMPORTANT LESSON LEARNED: re-running the full one-time preparation
-// sequence (api_signature_start(), i.e. SET_ROTATION -> ... ->
-// SIGNATURE_START) while a session is already active is NOT safe --
-// the pad rejects it mid-way, which cascades into close_pad() being
-// called and leaves a blank screen. That whole approach is abandoned.
+// Why the pad screen repaint is done this way:
 //
-// The only device command confirmed safe to send DURING an already
-// active session is TOKEN_CMD_API_SIGNATURE_RETRY (that's its very
-// purpose: "restart signing process" without tearing the session down).
-// So the strategy here is: Retry (safe, mid-session) to wipe the pad's
-// screen, then push the remaining strokes back with SET_TARGET(0) +
-// SET_IMAGE -- both plain Display calls, never touching
-// preparationState or re-entering api_signature_start().
+// Two earlier attempts blanked the pad and closed the session. The cause was
+// not the firmware refusing SET_IMAGE mid-session. The old onMessage()
+// dispatched every response to every handler, so the repaint's SET_TARGET and
+// SET_IMAGE responses also reached the preparation handler, whose SET_IMAGE
+// branch unconditionally did:
+//
+//     preparationState = preparationStates.setCancelButton;
+//     api_signature_start();
+//
+// which restarted the one-time preparation sequence in the middle of a live
+// session. That cascade fails, and its failure branches call close_pad().
+//
+// Three things prevent it now:
+//
+//   1. handleResponse() routes each response to exactly one handler, and the
+//      Undo state machine gets first refusal.
+//   2. Nothing in the Undo path calls close_pad(). On error it abandons the
+//      screen sync only; the session survives and the saved image stays
+//      correct because it comes from sigCanvas.
+//   3. The repaint never writes a bitmap to the live display. It renders into
+//      image store 1 and blits it with SET_IMAGE_FROM_STORE, exactly the
+//      mechanism the preparation sequence already uses:
+//
+//        SIGNATURE_RETRY          drop the strokes the firmware captured
+//        SET_TARGET      -> 1     off-screen store
+//        SET_IMAGE                template + remaining strokes
+//        SET_TEXT_IN_RECT x2      the two labels
+//        SET_TARGET      -> 0     live display
+//        SET_IMAGE_FROM_STORE     firmware-native blit, no payload
+
 function undo_last_stroke_send() {
     if (signatureStrokes.length === 0) {
         logMessage("-- undo ignored: no strokes");
@@ -1008,23 +652,19 @@ function undo_last_stroke_send() {
     }
 
     signatureStrokes.pop();
-    currentStrokeRef = null;
+    currentStroke = null;
 
-    // The local preview is fixed immediately and unconditionally. It is
-    // what signature_image_from_canvas() saves on Confirm, so the produced
-    // file is correct even if the pad-screen sync below fails.
+    // The preview is fixed immediately and unconditionally. It is what
+    // signature_image_from_canvas() saves on Confirm, so the produced file is
+    // correct even if the pad screen sync below fails.
     redrawSignatureCanvas();
     logMessage("-- undo: " + signatureStrokes.length + " stroke(s) left");
 
     undoSync_start();
 }
 
-// ---------------------------------------------------------------------
-// Undo -> pad screen synchronisation state machine
-// ---------------------------------------------------------------------
-
 function undoSync_orderedStates() {
-    var seq = [
+    var sequence = [
         undoStates.setStoreTarget,
         undoStates.setStoreImage,
         undoStates.setFieldText,
@@ -1032,37 +672,41 @@ function undoSync_orderedStates() {
         undoStates.setDisplayTarget,
         undoStates.blitStore
     ];
+
     if (UNDO_RETRY_FIRST) {
-        seq.unshift(undoStates.retry);
+        sequence.unshift(undoStates.retry);
     } else {
-        seq.push(undoStates.retry);
+        sequence.push(undoStates.retry);
     }
-    return seq;
+    return sequence;
 }
 
 function undoSync_messageFor(state) {
+    var profile = getPadProfile();
+
     switch (state) {
         case undoStates.retry:
-            return '{ "TOKEN_TYPE":"TOKEN_TYPE_REQUEST", "TOKEN_CMD":"TOKEN_CMD_API_SIGNATURE_RETRY" }';
+            return '{"TOKEN_TYPE":"TOKEN_TYPE_REQUEST", "TOKEN_CMD":"TOKEN_CMD_API_SIGNATURE_RETRY" }';
 
         case undoStates.setStoreTarget:
-            // target 1 = off-screen store, NOT the live display
-            return '{"TOKEN_TYPE":"TOKEN_TYPE_REQUEST", "TOKEN_CMD":"TOKEN_CMD_API_DISPLAY_SET_TARGET", "TOKEN_PARAM_TARGET":"1" }';
+            return displaySetTargetMessage(1);
 
         case undoStates.setStoreImage:
-            return '{"TOKEN_TYPE":"TOKEN_TYPE_REQUEST", "TOKEN_CMD":"TOKEN_CMD_API_DISPLAY_SET_IMAGE", "TOKEN_PARAM_X_POS":"0", "TOKEN_PARAM_Y_POS":"0", "TOKEN_PARAM_BITMAP":"' + undoCompositeImage + '" }';
+            return displaySetImageMessage(undoCompositeImage);
 
         case undoStates.setFieldText:
-            return buildTextInRectMessage(getFieldNameRect(), PAD_FIELD_NAME_TEXT);
+            return profile === null ? null
+                : displaySetTextMessage(profile.fieldNameRect, PAD_FIELD_NAME_TEXT);
 
         case undoStates.setCustomText:
-            return buildTextInRectMessage(getCustomTextRect(), PAD_CUSTOM_TEXT);
+            return profile === null ? null
+                : displaySetTextMessage(profile.customTextRect, PAD_CUSTOM_TEXT);
 
         case undoStates.setDisplayTarget:
-            return '{"TOKEN_TYPE":"TOKEN_TYPE_REQUEST", "TOKEN_CMD":"TOKEN_CMD_API_DISPLAY_SET_TARGET", "TOKEN_PARAM_TARGET":"0" }';
+            return displaySetTargetMessage(0);
 
         case undoStates.blitStore:
-            return '{"TOKEN_TYPE":"TOKEN_TYPE_REQUEST", "TOKEN_CMD":"TOKEN_CMD_API_DISPLAY_SET_IMAGE_FROM_STORE", "TOKEN_PARAM_STORE_ID":"' + UNDO_STORE_ID + '" }';
+            return displaySetImageFromStoreMessage(UNDO_STORE_ID);
 
         default:
             return null;
@@ -1071,110 +715,77 @@ function undoSync_messageFor(state) {
 
 function undoSync_expectedOrigin(state) {
     switch (state) {
-        case undoStates.retry:            return "TOKEN_CMD_API_SIGNATURE_RETRY";
-        case undoStates.setStoreTarget:   return "TOKEN_CMD_API_DISPLAY_SET_TARGET";
-        case undoStates.setStoreImage:    return "TOKEN_CMD_API_DISPLAY_SET_IMAGE";
-        case undoStates.setFieldText:     return "TOKEN_CMD_API_DISPLAY_SET_TEXT_IN_RECT";
-        case undoStates.setCustomText:    return "TOKEN_CMD_API_DISPLAY_SET_TEXT_IN_RECT";
+        case undoStates.retry: return "TOKEN_CMD_API_SIGNATURE_RETRY";
+        case undoStates.setStoreTarget: return "TOKEN_CMD_API_DISPLAY_SET_TARGET";
+        case undoStates.setStoreImage: return "TOKEN_CMD_API_DISPLAY_SET_IMAGE";
+        case undoStates.setFieldText: return "TOKEN_CMD_API_DISPLAY_SET_TEXT_IN_RECT";
+        case undoStates.setCustomText: return "TOKEN_CMD_API_DISPLAY_SET_TEXT_IN_RECT";
         case undoStates.setDisplayTarget: return "TOKEN_CMD_API_DISPLAY_SET_TARGET";
-        case undoStates.blitStore:        return "TOKEN_CMD_API_DISPLAY_SET_IMAGE_FROM_STORE";
-        default:                          return null;
+        case undoStates.blitStore: return "TOKEN_CMD_API_DISPLAY_SET_IMAGE_FROM_STORE";
+        default: return null;
     }
 }
 
 function undoSync_stateName(state) {
-    for (var k in undoStates) {
-        if (undoStates[k] === state) {
-            return k;
+    for (var key in undoStates) {
+        if (undoStates.hasOwnProperty(key) && undoStates[key] === state) {
+            return key;
         }
     }
     return "?" + state;
-}
-
-/**
-* Ends the pad-screen sync WITHOUT touching the signing session. Never
-* calls close_pad(): a failed screen repaint must not kill the signature.
-*/
-function undoSync_abort(reason) {
-    logMessage("!! undo sync aborted at " + undoSync_stateName(undoState) + ": " + reason);
-    undoSync_finish();
-}
-
-function undoSync_finish() {
-    if (undoTimeoutId !== null) {
-        clearTimeout(undoTimeoutId);
-        undoTimeoutId = null;
-    }
-    undoState = undoStates.idle;
-    undoSeq = [];
-    undoSeqIndex = -1;
-    undoCompositeImage = null;
-
-    if (undoResyncPending) {
-        // another Undo was pressed while this one was still in flight
-        undoResyncPending = false;
-        undoSync_start();
-    }
 }
 
 function undoSync_start() {
     if (!UNDO_SYNC_TO_PAD) {
         return;
     }
-    if (padState != padStates.opened) {
-        logMessage("-- undo sync skipped: pad not open");
+    if (padState !== padStates.opened) {
+        logMessage("-- undo sync skipped: pad is not open");
         return;
     }
-    if (padMode != padModes.API) {
-        logMessage("-- undo sync skipped: not in API mode");
-        return;
-    }
-    if (!originalBackgroundImage) {
+    if (backgroundImage === null) {
         logMessage("-- undo sync skipped: background template not loaded yet");
         return;
     }
-    if (undoState != undoStates.idle) {
-        // coalesce: re-run once the in-flight sequence is done
+    if (undoState !== undoStates.idle) {
+        // Retry pressed again while a sync is in flight: run once more after.
         undoResyncPending = true;
         logMessage("-- undo sync busy, queued a re-sync");
         return;
     }
 
-    buildCompositeBackgroundImage(function (compositeBase64) {
-        if (!compositeBase64) {
-            logMessage("!! undo sync: failed to build composite image");
+    buildCompositeImage(function (compositeBase64) {
+        if (compositeBase64 === null) {
             return;
         }
-        if (undoState != undoStates.idle) {
+        if (undoState !== undoStates.idle) {
             undoResyncPending = true;
             return;
         }
+
         undoCompositeImage = compositeBase64;
-        undoSeq = undoSync_orderedStates();
-        undoSeqIndex = -1;
+        undoSequence = undoSync_orderedStates();
+        undoSequenceIndex = -1;
         logMessage("-- undo sync start (retryFirst=" + UNDO_RETRY_FIRST + ")");
         undoSync_advance();
     });
 }
 
 function undoSync_advance() {
-    if (undoTimeoutId !== null) {
-        clearTimeout(undoTimeoutId);
-        undoTimeoutId = null;
-    }
+    clearUndoTimeout();
 
-    undoSeqIndex++;
-    if (undoSeqIndex >= undoSeq.length) {
-        logMessage("-- undo sync done: pad screen now matches the preview");
+    undoSequenceIndex++;
+    if (undoSequenceIndex >= undoSequence.length) {
+        logMessage("-- undo sync done: pad screen matches the preview");
         undoSync_finish();
         return;
     }
 
-    undoState = undoSeq[undoSeqIndex];
+    undoState = undoSequence[undoSequenceIndex];
 
     var message = undoSync_messageFor(undoState);
     if (message === null) {
-        undoSync_abort("no message for state");
+        undoSync_abort("no message for this step");
         return;
     }
 
@@ -1183,333 +794,164 @@ function undoSync_advance() {
         undoSync_abort("timed out waiting for " + undoSync_expectedOrigin(undoState));
     }, UNDO_TIMEOUT_MS);
 
-    logMessage(">> undo[" + undoSync_stateName(undoState) + "] " + message);
-    try {
-        signoPADAPIWeb.send(message);
-    } catch (e) {
-        undoSync_abort("send threw: " + e);
+    logMessage("-- undo step " + undoSync_stateName(undoState));
+    if (!sendMessage(message)) {
+        undoSync_abort("send failed");
     }
 }
 
 /**
-* Called by onMessage() BEFORE any other handler. Returns true when the
-* response belongs to the running Undo sequence, in which case onMessage()
-* must not pass it on -- letting these responses reach
-* api_signature_start_responses() is what restarted the preparation
-* sequence mid-session and closed the pad.
-*/
+ * Consulted by handleResponse() before any other handler. Returns true when
+ * the response belongs to the running Undo sequence, in which case no other
+ * handler may see it.
+ */
 function undoSync_handleResponse(obj) {
-    if (undoState == undoStates.idle) {
+    if (undoState === undoStates.idle) {
         return false;
     }
-    if (obj.TOKEN_CMD_ORIGIN != undoSync_expectedOrigin(undoState)) {
+    if (obj.TOKEN_CMD_ORIGIN !== undoSync_expectedOrigin(undoState)) {
         return false;
     }
 
-    var ret = obj.TOKEN_PARAM_RETURN_CODE;
-    if (ret < 0) {
-        logResponseError("undo sync step " + undoSync_stateName(undoState) + " failed", obj);
-        // deliberately NOT close_pad(): keep signing alive, give up on the
+    if (obj.TOKEN_PARAM_RETURN_CODE < 0) {
+        logResponseError("undo step " + undoSync_stateName(undoState) + " failed", obj);
+        // Deliberately not close_pad(): keep signing alive and give up on the
         // screen repaint only.
         undoSync_finish();
         return true;
     }
 
-    logMessage("<< undo[" + undoSync_stateName(undoState) + "] ok (ret=" + ret + ")");
+    logMessage("-- undo step " + undoSync_stateName(undoState) + " ok");
     undoSync_advance();
     return true;
 }
 
+/** Ends the screen sync without touching the signing session. */
+function undoSync_abort(reason) {
+    logMessage("!! undo sync aborted at " + undoSync_stateName(undoState) + ": " + reason);
+    undoSync_finish();
+}
+
+function undoSync_finish() {
+    clearUndoTimeout();
+
+    undoState = undoStates.idle;
+    undoSequence = [];
+    undoSequenceIndex = -1;
+    undoCompositeImage = null;
+
+    if (undoResyncPending) {
+        undoResyncPending = false;
+        undoSync_start();
+    }
+}
+
+function clearUndoTimeout() {
+    if (undoTimeoutId !== null) {
+        clearTimeout(undoTimeoutId);
+        undoTimeoutId = null;
+    }
+}
+
 /**
-* Draws the pad's own pristine template (originalBackgroundImage) then
-* the remaining strokes on top, at the same pixel size/scale used for
-* sigcanvas (sigcanvas.width/height already equal the pad's own display
-* resolution, since they were set from TOKEN_CMD_API_DISPLAY_GET_WIDTH/
-* HEIGHT). Calls back with a base64 PNG (no "data:image/..." prefix),
-* ready to be sent as TOKEN_PARAM_BITMAP.
-*/
-function buildCompositeBackgroundImage(callback) {
-    var tpl = new Image();
-    tpl.onload = function () {
+ * Renders the pristine template plus the remaining strokes at the pad's own
+ * display resolution and hands back a base64 PNG without the data URL prefix,
+ * ready to be sent as TOKEN_PARAM_BITMAP. Calls back with null on failure.
+ */
+function buildCompositeImage(callback) {
+    var template = new Image();
+
+    template.onload = function () {
         try {
-            var off = document.createElement("canvas");
-            off.width = sigcanvas.width;
-            off.height = sigcanvas.height;
+            var offscreen = document.createElement("canvas");
+            offscreen.width = sigcanvas.width;
+            offscreen.height = sigcanvas.height;
 
-            var ctx = off.getContext("2d");
-            ctx.drawImage(tpl, 0, 0, off.width, off.height);
+            var ctx = offscreen.getContext("2d");
+            ctx.drawImage(template, 0, 0, offscreen.width, offscreen.height);
 
-            // PAD_PEN_WIDTH (not 5) so the repainted strokes match the width
-            // the firmware itself drew with (TOKEN_CMD_API_DISPLAY_CONFIG_PEN)
-            drawStrokesOnContext(ctx, PAD_PEN_WIDTH);
+            // PAD_PEN_WIDTH so the repainted strokes match the width the
+            // firmware itself drew with (TOKEN_CMD_API_DISPLAY_CONFIG_PEN)
+            drawStrokes(ctx, PAD_PEN_WIDTH);
 
-            var dataURL = off.toDataURL("image/png");
-            callback(dataURL.replace(/^data:image\/(png|jpg);base64,/, ""));
+            var dataURL = offscreen.toDataURL("image/png");
+            callback(stripDataUrlPrefix(dataURL));
         } catch (e) {
-            logMessage("!! composite build failed: " + e);
+            logMessage("!! composite image failed: " + e);
             callback(null);
         }
     };
-    tpl.onerror = function () {
-        logMessage("!! composite build failed: background template did not load");
+
+    template.onerror = function () {
+        logMessage("!! composite image failed: background template did not load");
         callback(null);
     };
-    tpl.src = "data:image/png;base64," + originalBackgroundImage;
+
+    template.src = "data:image/png;base64," + backgroundImage;
 }
 
-/**
-* Replays signatureStrokes onto any 2d context, converting the stored raw
-* device coordinates to display pixels. Shared by the local preview and by
-* the composite pushed back to the pad.
-*/
-function drawStrokesOnContext(ctx, penWidth) {
-    ctx.lineWidth = penWidth;
-    ctx.lineCap = "round";
-
-    signatureStrokes.forEach(function (stroke) {
-        if (!stroke.points || stroke.points.length === 0) {
-            return;
-        }
-        ctx.fillStyle = stroke.color;
-        ctx.strokeStyle = stroke.color;
-        stroke.points.forEach(function (pt, idx) {
-            var sx = pt.x * scaleFactorX;
-            var sy = pt.y * scaleFactorY;
-            if (idx === 0) {
-                drawStrokeStartPoint(ctx, sx, sy);
-            } else {
-                drawStrokePoint(ctx, sx, sy);
-            }
-        });
-    });
+function stripDataUrlPrefix(dataURL) {
+    return String(dataURL).replace(/^data:image\/[a-z]+;base64,/, "");
 }
 
-// ---------------------------------------------------------------------
-// Per-model text rectangles. Single source of truth: used both by the
-// one-time preparation sequence and by the Undo repaint, so the two can
-// never drift apart.
-// ---------------------------------------------------------------------
-function getFieldNameRect() {
-    switch (padType) {
-        case padTypes.sigmaUSB:
-        case padTypes.sigmaSerial:
-            return { left: 15, top: 43, width: 285, height: 18 };
+// ---------------------------------------------------------------------------
+// Display command builders, shared by preparation and Undo
+// ---------------------------------------------------------------------------
 
-        case padTypes.omegaUSB:
-        case padTypes.omegaSerial:
-            return { left: 40, top: 86, width: 570, height: 40 };
-
-        case padTypes.gammaUSB:
-        case padTypes.gammaSerial:
-            return { left: 40, top: 86, width: 720, height: 40 };
-
-        case padTypes.deltaUSB:
-        case padTypes.deltaSerial:
-        case padTypes.deltaIP:
-            return { left: 40, top: 86, width: 1200, height: 50 };
-
-        case padTypes.alphaUSB:
-        case padTypes.alphaSerial:
-        case padTypes.alphaIP:
-            return { left: 20, top: 120, width: 730, height: 30 };
-
-        default:
-            return null;
-    }
+function displaySetTargetMessage(target) {
+    return '{"TOKEN_TYPE":"TOKEN_TYPE_REQUEST", "TOKEN_CMD":"TOKEN_CMD_API_DISPLAY_SET_TARGET"' +
+        ', "TOKEN_PARAM_TARGET":"' + target + '" }';
 }
 
-function getCustomTextRect() {
-    switch (padType) {
-        case padTypes.sigmaUSB:
-        case padTypes.sigmaSerial:
-            return { left: 15, top: 110, width: 265, height: 18 };
-
-        case padTypes.omegaUSB:
-        case padTypes.omegaSerial:
-            return { left: 40, top: 350, width: 520, height: 40 };
-
-        case padTypes.gammaUSB:
-        case padTypes.gammaSerial:
-            return { left: 40, top: 350, width: 670, height: 40 };
-
-        case padTypes.deltaUSB:
-        case padTypes.deltaSerial:
-        case padTypes.deltaIP:
-            return { left: 40, top: 640, width: 670, height: 50 };
-
-        case padTypes.alphaUSB:
-        case padTypes.alphaSerial:
-        case padTypes.alphaIP:
-            return { left: 20, top: 1316, width: 730, height: 30 };
-
-        default:
-            return null;
-    }
+function displaySetImageMessage(base64Png) {
+    return '{"TOKEN_TYPE":"TOKEN_TYPE_REQUEST", "TOKEN_CMD":"TOKEN_CMD_API_DISPLAY_SET_IMAGE"' +
+        ', "TOKEN_PARAM_X_POS":"0", "TOKEN_PARAM_Y_POS":"0"' +
+        ', "TOKEN_PARAM_BITMAP":"' + base64Png + '" }';
 }
 
-function buildTextInRectMessage(rect, text) {
-    if (rect === null) {
-        return null;
-    }
-    return '{"TOKEN_TYPE":"TOKEN_TYPE_REQUEST", "TOKEN_CMD":"TOKEN_CMD_API_DISPLAY_SET_TEXT_IN_RECT' +
-        '", "TOKEN_PARAM_LEFT":"' + rect.left +
+function displaySetImageFromStoreMessage(storeId) {
+    return '{"TOKEN_TYPE":"TOKEN_TYPE_REQUEST", "TOKEN_CMD":"TOKEN_CMD_API_DISPLAY_SET_IMAGE_FROM_STORE"' +
+        ', "TOKEN_PARAM_STORE_ID":"' + storeId + '" }';
+}
+
+function displaySetTextMessage(rect, text) {
+    return '{"TOKEN_TYPE":"TOKEN_TYPE_REQUEST", "TOKEN_CMD":"TOKEN_CMD_API_DISPLAY_SET_TEXT_IN_RECT"' +
+        ', "TOKEN_PARAM_LEFT":"' + rect.left +
         '", "TOKEN_PARAM_TOP":"' + rect.top +
         '", "TOKEN_PARAM_WIDTH":"' + rect.width +
         '", "TOKEN_PARAM_HEIGHT":"' + rect.height +
-        '", "TOKEN_PARAM_ALIGNMENT":"3", "TOKEN_PARAM_TEXT":"' + text + '", "TOKEN_PARAM_OPTIONS":"0" }';
+        '", "TOKEN_PARAM_ALIGNMENT":"3", "TOKEN_PARAM_TEXT":"' + text +
+        '", "TOKEN_PARAM_OPTIONS":"0" }';
 }
-// undo last stroke end
-// api sensor hot spot pressed send end
 
-// api display scroll pos changed send begin
-// TOKEN_CMD_API_DISPLAY_SCROLL_POS_CHANGED
-function api_display_scroll_pos_changed_send(xPos, yPos) {
-    console.log(xPos + "," + yPos);
-}
-// api display scroll pos changed send end
+// ---------------------------------------------------------------------------
+// Step 1: search for pads
+// ---------------------------------------------------------------------------
 
-// getSignature begin
 function getSignature() {
+    sigcanvas = byId("sigCanvas");
+    if (sigcanvas === null) {
+        logMessage("!! sigCanvas element not found");
+        return;
+    }
+    if (signoPADAPIWeb === null) {
+        logMessage("!! not connected to the signotec service");
+        return;
+    }
 
-    sigcanvas = document.getElementById("sigCanvas");
-
-    //delete the previous signature
-    var ctx = sigcanvas.getContext("2d");
-    ctx.clearRect(0, 0, sigcanvas.width, sigcanvas.height);
-
-    // new signing session: reset local stroke history used by Undo
-    signatureStrokes = [];
-    currentStrokeRef = null;
-
-    //document.getElementById("Signature_0").src = "White.png";
-    //document.getElementById("SignData_0").value = "";
-
-    //var padConnectionTypeList = document.getElementById("PadConnectionTypeList");
-    padConnectionType = "HID";
+    resetSignature();
+    resetPipelineState();
 
     api_search_for_pads();
-
-    
-}
-// getSignature end
-
-// getSignatureDefault begin
-// search for pads begin
-// TOKEN_CMD_SEARCH_FOR_PADS
-function search_for_pads() {
-    var message;
-
-    //search for defailt pads
-    message = '{"TOKEN_TYPE":"TOKEN_TYPE_REQUEST", "TOKEN_CMD":"TOKEN_CMD_SEARCH_FOR_PADS", "TOKEN_PARAM_PAD_SUBSET":"' + padConnectionType + '" }';
-
-    signoPADAPIWeb.send(message);
-    logMessage(message);
 }
 
-function search_for_pads_response(obj) {
-    if (obj.TOKEN_CMD_ORIGIN == "TOKEN_CMD_SEARCH_FOR_PADS") {
-        //check the return code
-        var ret = obj.TOKEN_PARAM_RETURN_CODE;
-        if (ret < 0) {
-            logResponseError("The search for pads failed", obj);
-            searchState = searchStates.setPadType;
-            openState = openStates.openPad;
-            preparationState = preparationStates.setDisplayRotation;
-            close_pad();
-            return;
-        }
-
-        //check for connected pads
-        if (obj.TOKEN_PARAM_CONNECTED_PADS == null) {
-            //alert("No connected pads have been found.");
-            searchState = searchStates.setPadType;
-            openState = openStates.openPad;
-            preparationState = preparationStates.setDisplayRotation;
-            return;
-        }
-
-        padType = parseInt(obj.TOKEN_PARAM_CONNECTED_PADS[0].TOKEN_PARAM_PAD_TYPE);
-
-        //show the pads properties
-        //document.getElementById("PadType_0").innerHTML = getReadableType(padType);
-        //document.getElementById("SerialNumber_0").innerHTML = obj.TOKEN_PARAM_CONNECTED_PADS[0].TOKEN_PARAM_PAD_SERIAL_NUMBER;
-        //document.getElementById("FirmwareVersion_0").innerHTML = obj.TOKEN_PARAM_CONNECTED_PADS[0].TOKEN_PARAM_PAD_FIRMWARE_VERSION;
-
-        if (obj.TOKEN_PARAM_CONNECTED_PADS[0].TOKEN_PARAM_PAD_CAPABILITIES & deviceCapabilities.SupportsRSA) {
-            supportsRSA = true;
-        }
-        else {
-            supportsRSA = false;
-        }
-
-        if (supportsRSA) {
-            document.getElementById("RSASupport_0").innerHTML = "Yes";
-        }
-        else {
-            document.getElementById("RSASupport_0").innerHTML = "No";
-        }
-
-        //try to open the connected pad
-        open_pad();
-    }
-    else {
-        // do nothing
-    }
-}
-// search for pads end
-
-// open pad begin
-// TOKEN_CMD_OPEN_PAD
-function open_pad() {
-    var message;
-
-    message = '{"TOKEN_TYPE":"TOKEN_TYPE_REQUEST", "TOKEN_CMD":"TOKEN_CMD_OPEN_PAD", "TOKEN_PARAM_PAD_INDEX":"' + padIndex + '" }';
-
-    signoPADAPIWeb.send(message);
-    logMessage(message);
-}
-
-function open_pad_response(obj) {
-    if (obj.TOKEN_CMD_ORIGIN == "TOKEN_CMD_OPEN_PAD") {
-        //check the return code
-        var ret = obj.TOKEN_PARAM_RETURN_CODE;
-        if (ret < 0) {
-            logResponseError("Failed to open pad", obj);
-            searchState = searchStates.setPadType;
-            openState = openStates.openPad;
-            preparationState = preparationStates.setDisplayRotation;
-            return;
-        }
-
-        padState = padStates.opened;
-
-        //set canvas size
-        sigcanvas.width = obj.TOKEN_PARAM_PAD_DISPLAY_WIDTH;
-        sigcanvas.height = obj.TOKEN_PARAM_PAD_DISPLAY_HEIGHT;
-
-        //get scale factor from siganture resolution to canvas
-        scaleFactorX = obj.TOKEN_PARAM_PAD_DISPLAY_WIDTH / obj.TOKEN_PARAM_PAD_X_RESOLUTION;
-        scaleFactorY = obj.TOKEN_PARAM_PAD_DISPLAY_HEIGHT / obj.TOKEN_PARAM_PAD_Y_RESOLUTION;
-
-        //start the signature process
-        selection_dialog();
-    }
-    else {
-        // do nothing
-    }
-}
-// open pad end
-// getSignatureDefault end
-
-// getSignatureAPI begin
-// api search for pads begin
-// TOKEN_CMD_API_DEVICE_SET_COM_PORT and TOKEN_CMD_API_DEVICE_GET_COUNT and infos (searchStates states)
 function api_search_for_pads() {
     var message;
 
     switch (searchState) {
         case searchStates.setPadType:
-            message = '{"TOKEN_TYPE":"TOKEN_TYPE_REQUEST", "TOKEN_CMD":"TOKEN_CMD_API_DEVICE_SET_COM_PORT", "TOKEN_PARAM_PORT_LIST":"' + padConnectionType + '" }';
+            message = '{"TOKEN_TYPE":"TOKEN_TYPE_REQUEST", "TOKEN_CMD":"TOKEN_CMD_API_DEVICE_SET_COM_PORT"' +
+                ', "TOKEN_PARAM_PORT_LIST":"' + padConnectionType + '" }';
             break;
 
         case searchStates.search:
@@ -1517,174 +959,138 @@ function api_search_for_pads() {
             break;
 
         case searchStates.getInfo:
-            // get info of first pad
-            message = '{"TOKEN_TYPE":"TOKEN_TYPE_REQUEST", "TOKEN_CMD":"TOKEN_CMD_API_DEVICE_GET_INFO", "TOKEN_PARAM_INDEX":"' + padIndex + '" }';
+            message = '{"TOKEN_TYPE":"TOKEN_TYPE_REQUEST", "TOKEN_CMD":"TOKEN_CMD_API_DEVICE_GET_INFO"' +
+                ', "TOKEN_PARAM_INDEX":"' + padIndex + '" }';
             break;
 
         case searchStates.getVersion:
-            // get firmware version of first pad
-            message = '{"TOKEN_TYPE":"TOKEN_TYPE_REQUEST", "TOKEN_CMD":"TOKEN_CMD_API_DEVICE_GET_VERSION", "TOKEN_PARAM_INDEX":"' + padIndex + '" }';
+            message = '{"TOKEN_TYPE":"TOKEN_TYPE_REQUEST", "TOKEN_CMD":"TOKEN_CMD_API_DEVICE_GET_VERSION"' +
+                ', "TOKEN_PARAM_INDEX":"' + padIndex + '" }';
             break;
 
         default:
-            searchState = searchStates.setPadType;
-            //alert("invalid searchState");
+            logMessage("!! invalid searchState " + searchState);
+            resetPipelineState();
             return;
     }
-    //debugger
-    signoPADAPIWeb.send(message);
-    
-    logMessage(message);
+
+    sendMessage(message);
 }
 
-function api_search_for_pads_responses(obj) {
-    if (obj.TOKEN_CMD_ORIGIN == "TOKEN_CMD_API_DEVICE_SET_COM_PORT") {
-        //check the return code
-        var ret = obj.TOKEN_PARAM_RETURN_CODE;
-        if (ret < 0) {
-            logResponseError("Failed to set pad type", obj);
-            searchState = searchStates.setPadType;
-            openState = openStates.openPad;
-            preparationState = preparationStates.setDisplayRotation;
-            close_pad();
-            return;
-        }
-
-        //search for api pads
-        searchState = searchStates.search;
-        api_search_for_pads();
+function onSetComPortResponse(obj) {
+    if (failed(obj, "failed to set the pad type")) {
+        return;
     }
-    else if (obj.TOKEN_CMD_ORIGIN == "TOKEN_CMD_API_DEVICE_GET_COUNT") {
-        //check the return code
-        var ret = obj.TOKEN_PARAM_RETURN_CODE;
-        if (ret < 0) {
-            logResponseError("The search for pads failed", obj);
-            //search finished, reset search state
-            searchState = searchStates.setPadType;
-            openState = openStates.openPad;
-            preparationState = preparationStates.setDisplayRotation;
-            close_pad();
-            return;
-        }
-
-        //check for connected pads
-        if (ret == 0) {
-            //alert("No connected pads have been found.");
-            //search finished, reset search state
-            searchState = searchStates.setPadType;
-            openState = openStates.openPad;
-            preparationState = preparationStates.setDisplayRotation;
-            close_pad();
-            return;
-        }
-
-        //get device info
-        searchState = searchStates.getInfo;
-        api_search_for_pads();
-    }
-    else if (obj.TOKEN_CMD_ORIGIN == "TOKEN_CMD_API_DEVICE_GET_INFO") {
-        //check the return code
-        var ret = obj.TOKEN_PARAM_RETURN_CODE;
-        if (ret < 0) {
-            logResponseError("Failed to get device info", obj);
-            searchState = searchStates.setPadType;
-            openState = openStates.openPad;
-            preparationState = preparationStates.setDisplayRotation;
-            close_pad();
-            return;
-        }
-
-        //remember pad type, get image and get button size
-        padType = parseInt(obj.TOKEN_PARAM_TYPE);
-        switch (padType) {
-            case padTypes.sigmaUSB:
-            case padTypes.sigmaSerial:
-                getBackgroundImage("Sigma");
-                buttonSize = 36;
-                buttonTop = 2;
-                break;
-
-            case padTypes.omegaUSB:
-            case padTypes.omegaSerial:
-                getBackgroundImage("Omega");
-                buttonSize = 48;
-                buttonTop = 4;
-                break;
-
-            case padTypes.gammaUSB:
-            case padTypes.gammaSerial:
-                getBackgroundImage("Gamma");
-                buttonSize = 48;
-                buttonTop = 4;
-                break;
-
-            case padTypes.deltaUSB:
-            case padTypes.deltaSerial:
-            case padTypes.deltaIP:
-                getBackgroundImage("Delta");
-                buttonSize = 48;
-                buttonTop = 4;
-                break;
-
-            case padTypes.alphaUSB:
-            case padTypes.alphaSerial:
-            case padTypes.alphaIP:
-                getBackgroundImage("Alpha");
-                buttonSize = 80;
-                buttonTop = 10;
-                break;
-        }
-
-        //print device info
-        //document.getElementById("PadType_0").innerHTML = getReadableType(padType);
-        //document.getElementById("SerialNumber_0").innerHTML = obj.TOKEN_PARAM_SERIAL;
-
-        //get firmware version
-        searchState = searchStates.getVersion;
-        api_search_for_pads();
-    }
-    else if (obj.TOKEN_CMD_ORIGIN == "TOKEN_CMD_API_DEVICE_GET_VERSION") {
-        //check the return code
-        var ret = obj.TOKEN_PARAM_RETURN_CODE;
-        if (ret < 0) {
-            logResponseError("Failed to get device version", obj);
-            searchState = searchStates.setPadType;
-            openState = openStates.openPad;
-            preparationState = preparationStates.setDisplayRotation;
-            close_pad();
-            return;
-        }
-
-        //print firmware version
-        //document.getElementById("FirmwareVersion_0").innerHTML = obj.TOKEN_PARAM_VERSION;
-
-        //search finished, reset search state
-        searchState = searchStates.setPadType;
-
-        //try to open the connected pad
-        api_device_open();
-    }
-    else {
-        // do nothing
-    }
+    searchState = searchStates.search;
+    api_search_for_pads();
 }
-// api search for pads end
 
-// api device open begin
-// TOKEN_CMD_API_DEVICE_OPEN and infos, properties (openStates states)
+function onGetCountResponse(obj) {
+    if (failed(obj, "the search for pads failed")) {
+        return;
+    }
+    if (obj.TOKEN_PARAM_RETURN_CODE === 0) {
+        logMessage("!! no connected pads have been found");
+        resetPipelineState();
+        return;
+    }
+
+    searchState = searchStates.getInfo;
+    api_search_for_pads();
+}
+
+function onGetInfoResponse(obj) {
+    if (failed(obj, "failed to get the device info")) {
+        return;
+    }
+
+    padType = parseInt(obj.TOKEN_PARAM_TYPE, 10);
+    logMessage("-- pad type " + getReadableType(padType) +
+        ", serial " + obj.TOKEN_PARAM_SERIAL);
+
+    var profile = getPadProfile();
+    if (profile === null) {
+        logMessage("!! unsupported pad type " + padType);
+        resetPipelineState();
+        close_pad();
+        return;
+    }
+
+    supportsRSA = (obj.TOKEN_PARAM_CAPABILITIES & deviceCapabilities.SupportsRSA) !== 0;
+    setText("RSASupport_0", supportsRSA ? "Yes" : "No");
+    setText("PadType_0", getReadableType(padType));
+    setText("SerialNumber_0", obj.TOKEN_PARAM_SERIAL);
+
+    loadBackgroundImage(profile.imageId);
+
+    searchState = searchStates.getVersion;
+    api_search_for_pads();
+}
+
+function onGetVersionResponse(obj) {
+    if (failed(obj, "failed to get the device version")) {
+        return;
+    }
+
+    setText("FirmwareVersion_0", obj.TOKEN_PARAM_VERSION);
+    searchState = searchStates.setPadType;
+
+    api_device_open();
+}
+
+/**
+ * Caches the per-model template PNG (border, title, button graphics) as
+ * base64. Undo always composites onto this pristine copy, so repeated undos
+ * never accumulate or double-draw anything.
+ */
+function loadBackgroundImage(imageId) {
+    var element = byId(imageId);
+    if (element === null) {
+        logMessage("!! background image element '" + imageId + "' not found");
+        return;
+    }
+
+    var img = new Image();
+    img.setAttribute("crossOrigin", "anonymous");
+
+    img.onload = function () {
+        try {
+            var canvas = document.createElement("canvas");
+            canvas.width = this.width;
+            canvas.height = this.height;
+            canvas.getContext("2d").drawImage(this, 0, 0);
+
+            backgroundImage = stripDataUrlPrefix(canvas.toDataURL("image/png"));
+            logMessage("-- background template '" + imageId + "' loaded");
+        } catch (e) {
+            logMessage("!! background template '" + imageId + "' failed: " + e);
+        }
+    };
+
+    img.onerror = function () {
+        logMessage("!! background template '" + imageId + "' failed to load");
+    };
+
+    img.src = element.src;
+}
+
+// ---------------------------------------------------------------------------
+// Step 2: open the pad and read its geometry
+// ---------------------------------------------------------------------------
+
 function api_device_open() {
     var message;
 
     switch (openState) {
         case openStates.openPad:
-            message = '{"TOKEN_TYPE":"TOKEN_TYPE_REQUEST", "TOKEN_CMD":"TOKEN_CMD_API_DEVICE_OPEN", "TOKEN_PARAM_INDEX":"' + padIndex + '", "TOKEN_PARAM_ERASE_DISPLAY":"FALSE" }';
+            message = '{"TOKEN_TYPE":"TOKEN_TYPE_REQUEST", "TOKEN_CMD":"TOKEN_CMD_API_DEVICE_OPEN"' +
+                ', "TOKEN_PARAM_INDEX":"' + padIndex + '", "TOKEN_PARAM_ERASE_DISPLAY":"FALSE" }';
             break;
 
         case openStates.setColor:
-            message = '{"TOKEN_TYPE":"TOKEN_TYPE_REQUEST", "TOKEN_CMD":"TOKEN_CMD_API_DISPLAY_CONFIG_PEN' +
-                '", "TOKEN_PARAM_WIDTH":"' + '3' +
-                '", "TOKEN_PARAM_PEN_COLOR":"' + document.getElementById("signaturePenColorSelect").value +
-                '" }';
+            message = '{"TOKEN_TYPE":"TOKEN_TYPE_REQUEST", "TOKEN_CMD":"TOKEN_CMD_API_DISPLAY_CONFIG_PEN"' +
+                ', "TOKEN_PARAM_WIDTH":"' + PAD_PEN_WIDTH +
+                '", "TOKEN_PARAM_PEN_COLOR":"' + getSelectedPenColor() + '" }';
             break;
 
         case openStates.getDisplayWidth:
@@ -1700,130 +1106,92 @@ function api_device_open() {
             break;
 
         default:
-            openState = openStates.openPad;
-            //alert("invalid openState");
+            logMessage("!! invalid openState " + openState);
+            resetPipelineState();
             return;
     }
-    signoPADAPIWeb.send(message);
-    logMessage(message);
+
+    sendMessage(message);
 }
 
-function api_device_open_responses(obj) {
-    if (obj.TOKEN_CMD_ORIGIN == "TOKEN_CMD_API_DEVICE_OPEN") {
-        //check the return code
-        var ret = obj.TOKEN_PARAM_RETURN_CODE;
-        if (ret < 0) {
-            logResponseError("Failed to open pad", obj);
-            searchState = searchStates.setPadType;
-            openState = openStates.openPad;
-            preparationState = preparationStates.setDisplayRotation;
-            return;
-        }
-
-        padState = padStates.opened;
-
-        // FIX: the whole pipeline (api_search_for_pads / api_device_open /
-        // api_signature_start) only ever uses the API-mode functions, but
-        // padMode was still left at its default value (Default = 0)
-        // because ModeListName_onchange() is never called. Every function
-        // that branches on padMode (retry/confirm/cancel/image/sign_data)
-        // was sending the wrong (non-API) token as a result. Force it here.
-        padMode = padModes.API;
-
-        //set color
-        openState = openStates.setColor;
-        api_device_open();
+function onDeviceOpenResponse(obj) {
+    if (obj.TOKEN_PARAM_RETURN_CODE < 0) {
+        // The pad is not open, so close_pad() would be wrong here.
+        logResponseError("failed to open the pad", obj);
+        resetPipelineState();
+        return;
     }
-    else if (obj.TOKEN_CMD_ORIGIN == "TOKEN_CMD_API_DISPLAY_CONFIG_PEN") {
-        //check the return code
-        var ret = obj.TOKEN_PARAM_RETURN_CODE;
-        if (ret < 0) {
-            logResponseError("Failed to set color", obj);
-            searchState = searchStates.setPadType;
-            openState = openStates.openPad;
-            preparationState = preparationStates.setDisplayRotation;
-            close_pad();
-            return;
-        }
 
-        //get display width
-        openState = openStates.getDisplayWidth;
-        api_device_open();
-    }
-    else if (obj.TOKEN_CMD_ORIGIN == "TOKEN_CMD_API_DISPLAY_GET_WIDTH") {
-        //check the return code
-        var ret = obj.TOKEN_PARAM_RETURN_CODE;
-        if (ret < 0) {
-            logResponseError("Failed to get display width", obj);
-            searchState = searchStates.setPadType;
-            openState = openStates.openPad;
-            preparationState = preparationStates.setDisplayRotation;
-            close_pad();
-            return;
-        }
+    padState = padStates.opened;
 
-        //set canvas width
-        sigcanvas.width = ret;
-
-        //get display height
-        openState = openStates.getDisplayHeight;
-        api_device_open();
-    }
-    else if (obj.TOKEN_CMD_ORIGIN == "TOKEN_CMD_API_DISPLAY_GET_HEIGHT") {
-        //check the return code
-        var ret = obj.TOKEN_PARAM_RETURN_CODE;
-        if (ret < 0) {
-            logResponseError("Failed to get display height", obj);
-            searchState = searchStates.setPadType;
-            openState = openStates.openPad;
-            preparationState = preparationStates.setDisplayRotation;
-            close_pad();
-            return;
-        }
-
-        //set canvas height
-        sigcanvas.height = ret;
-
-        //get signature point resolution
-        openState = openStates.getResolution;
-        api_device_open();
-    }
-    else if (obj.TOKEN_CMD_ORIGIN == "TOKEN_CMD_API_SIGNATURE_GET_RESOLUTION") {
-        //check the return code
-        var ret = obj.TOKEN_PARAM_RETURN_CODE;
-        if (ret < 0) {
-            logResponseError("Failed to get signature resolution", obj);
-            searchState = searchStates.setPadType;
-            openState = openStates.openPad;
-            preparationState = preparationStates.setDisplayRotation;
-            close_pad();
-            return;
-        }
-
-        //get scale factor from siganture resolution to canvas
-        scaleFactorX = sigcanvas.width / obj.TOKEN_PARAM_PAD_X_RESOLUTION;
-        scaleFactorY = sigcanvas.height / obj.TOKEN_PARAM_PAD_Y_RESOLUTION;
-
-        //reset open state
-        openState = openStates.openPad;
-
-        //start the signature process
-        api_signature_start();
-    }
-    else {
-        // do nothing
-    }
+    openState = openStates.setColor;
+    api_device_open();
 }
-// api device open end
 
-// api signature start begin
-// TOKEN_CMD_API_SIGNATURE_START (preparationStates states)
+function onConfigPenResponse(obj) {
+    if (failed(obj, "failed to configure the pen")) {
+        return;
+    }
+    openState = openStates.getDisplayWidth;
+    api_device_open();
+}
+
+function onGetDisplayWidthResponse(obj) {
+    if (failed(obj, "failed to get the display width")) {
+        return;
+    }
+    sigcanvas.width = obj.TOKEN_PARAM_RETURN_CODE;
+
+    openState = openStates.getDisplayHeight;
+    api_device_open();
+}
+
+function onGetDisplayHeightResponse(obj) {
+    if (failed(obj, "failed to get the display height")) {
+        return;
+    }
+    sigcanvas.height = obj.TOKEN_PARAM_RETURN_CODE;
+
+    openState = openStates.getResolution;
+    api_device_open();
+}
+
+function onGetResolutionResponse(obj) {
+    if (failed(obj, "failed to get the signature resolution")) {
+        return;
+    }
+
+    // signature coordinates -> display pixels
+    scaleFactorX = sigcanvas.width / obj.TOKEN_PARAM_PAD_X_RESOLUTION;
+    scaleFactorY = sigcanvas.height / obj.TOKEN_PARAM_PAD_Y_RESOLUTION;
+
+    openState = openStates.openPad;
+    api_signature_start();
+}
+
+// ---------------------------------------------------------------------------
+// Step 3: prepare the pad screen and start capture
+// ---------------------------------------------------------------------------
+//
+// Everything up to setForegroundTarget is rendered into image store 1, which
+// switchBuffers then blits onto the live display. Running this sequence again
+// mid-session is not safe: it is what the Undo path must never trigger.
+
 function api_signature_start() {
+    var profile = getPadProfile();
+    if (profile === null) {
+        logMessage("!! unsupported pad type " + padType);
+        resetPipelineState();
+        close_pad();
+        return;
+    }
+
     var message;
 
     switch (preparationState) {
         case preparationStates.setDisplayRotation:
-            message = '{"TOKEN_TYPE":"TOKEN_TYPE_REQUEST", "TOKEN_CMD":"TOKEN_CMD_API_DISPLAY_SET_ROTATION", "TOKEN_PARAM_ROTATION":"0" }';
+            message = '{"TOKEN_TYPE":"TOKEN_TYPE_REQUEST", "TOKEN_CMD":"TOKEN_CMD_API_DISPLAY_SET_ROTATION"' +
+                ', "TOKEN_PARAM_ROTATION":"0" }';
             break;
 
         case preparationStates.getDisplayRotation:
@@ -1831,88 +1199,51 @@ function api_signature_start() {
             break;
 
         case preparationStates.setBackgroundTarget:
-            message = '{"TOKEN_TYPE":"TOKEN_TYPE_REQUEST", "TOKEN_CMD":"TOKEN_CMD_API_DISPLAY_SET_TARGET", "TOKEN_PARAM_TARGET":"1" }';
+            message = displaySetTargetMessage(UNDO_STORE_ID);
             break;
 
         case preparationStates.setBackgroundImage:
-            message = '{"TOKEN_TYPE":"TOKEN_TYPE_REQUEST", "TOKEN_CMD":"TOKEN_CMD_API_DISPLAY_SET_IMAGE", "TOKEN_PARAM_X_POS":"0", "TOKEN_PARAM_Y_POS":"0", "TOKEN_PARAM_BITMAP":"' + backgroundImage + '" }';
+            if (backgroundImage === null) {
+                logMessage("!! background template is not loaded yet");
+                resetPipelineState();
+                close_pad();
+                return;
+            }
+            message = displaySetImageMessage(backgroundImage);
             break;
 
         case preparationStates.setCancelButton:
+            buttonDiff = sigcanvas.width / 3;
+            buttonLeft = (buttonDiff - profile.buttonSize) / 2;
+            message = addHotSpotMessage(buttonLeft, profile);
+            break;
+
         case preparationStates.setRetryButton:
         case preparationStates.setConfirmButton:
-            switch (preparationState) {
-                case preparationStates.setCancelButton:
-                    buttonDiff = sigcanvas.width / 3;
-                    buttonLeft = (buttonDiff - buttonSize) / 2;
-                    break;
-
-                case preparationStates.setRetryButton:
-                case preparationStates.setConfirmButton:
-                    buttonLeft = buttonLeft + buttonDiff;
-                    break;
-
-                default:
-                    preparationState = preparationStates.setDisplayRotation;
-                    //alert("invalid preparationState");
-                    return;
-            }
-            message = '{"TOKEN_TYPE":"TOKEN_TYPE_REQUEST", "TOKEN_CMD":"TOKEN_CMD_API_SENSOR_ADD_HOT_SPOT", "TOKEN_PARAM_LEFT":"' + Math.round(buttonLeft) + '", "TOKEN_PARAM_TOP":"' + buttonTop + '", "TOKEN_PARAM_WIDTH":"' + buttonSize + '", "TOKEN_PARAM_HEIGHT":"' + buttonSize + '" }';
+            buttonLeft = buttonLeft + buttonDiff;
+            message = addHotSpotMessage(buttonLeft, profile);
             break;
 
         case preparationStates.setSignRect:
-            var top;
-            switch (padType) {
-                case padTypes.sigmaUSB:
-                case padTypes.sigmaSerial:
-                    top = 40;
-                    break;
-
-                case padTypes.omegaUSB:
-                case padTypes.omegaSerial:
-                case padTypes.gammaUSB:
-                case padTypes.gammaSerial:
-                case padTypes.deltaUSB:
-                case padTypes.deltaSerial:
-                case padTypes.deltaIP:
-                    top = 56;
-                    break;
-
-                case padTypes.alphaUSB:
-                case padTypes.alphaSerial:
-                case padTypes.alphaIP:
-                    top = 100;
-                    break;
-
-                default:
-                    //alert("unkown pad type");
-                    return;
-            }
-            message = '{"TOKEN_TYPE":"TOKEN_TYPE_REQUEST", "TOKEN_CMD":"TOKEN_CMD_API_SENSOR_SET_SIGN_RECT", "TOKEN_PARAM_LEFT":"0", "TOKEN_PARAM_TOP":"' + top + '", "TOKEN_PARAM_WIDTH":"0", "TOKEN_PARAM_HEIGHT":"0" }';
+            message = '{"TOKEN_TYPE":"TOKEN_TYPE_REQUEST", "TOKEN_CMD":"TOKEN_CMD_API_SENSOR_SET_SIGN_RECT"' +
+                ', "TOKEN_PARAM_LEFT":"0", "TOKEN_PARAM_TOP":"' + profile.signRectTop +
+                '", "TOKEN_PARAM_WIDTH":"0", "TOKEN_PARAM_HEIGHT":"0" }';
             break;
 
         case preparationStates.setFieldName:
-            message = buildTextInRectMessage(getFieldNameRect(), PAD_FIELD_NAME_TEXT);
-            if (message === null) {
-                logMessage("!! unknown pad type " + padType + " (field name rect)");
-                return;
-            }
+            message = displaySetTextMessage(profile.fieldNameRect, PAD_FIELD_NAME_TEXT);
             break;
 
         case preparationStates.setCustomText:
-            message = buildTextInRectMessage(getCustomTextRect(), PAD_CUSTOM_TEXT);
-            if (message === null) {
-                logMessage("!! unknown pad type " + padType + " (custom text rect)");
-                return;
-            }
+            message = displaySetTextMessage(profile.customTextRect, PAD_CUSTOM_TEXT);
             break;
 
         case preparationStates.setForegroundTarget:
-            message = '{"TOKEN_TYPE":"TOKEN_TYPE_REQUEST", "TOKEN_CMD":"TOKEN_CMD_API_DISPLAY_SET_TARGET", "TOKEN_PARAM_TARGET":"0" }';
+            message = displaySetTargetMessage(0);
             break;
 
         case preparationStates.switchBuffers:
-            message = '{"TOKEN_TYPE":"TOKEN_TYPE_REQUEST", "TOKEN_CMD":"TOKEN_CMD_API_DISPLAY_SET_IMAGE_FROM_STORE", "TOKEN_PARAM_STORE_ID":"1" }';
+            message = displaySetImageFromStoreMessage(UNDO_STORE_ID);
             break;
 
         case preparationStates.startSignature:
@@ -1920,637 +1251,473 @@ function api_signature_start() {
             break;
 
         default:
-            preparationState = preparationStates.setDisplayRotation;
-            //alert("invalid preparationState");
+            logMessage("!! invalid preparationState " + preparationState);
+            resetPipelineState();
             return;
     }
-    signoPADAPIWeb.send(message);
-    logMessage(message);
+
+    sendMessage(message);
 }
 
-function api_signature_start_responses(obj) {
-    // NOTE: responses belonging to an in-flight Undo repaint never reach
-    // this function -- undoSync_handleResponse() consumes them in
-    // onMessage() and returns. That is essential: the SET_IMAGE branch
-    // below unconditionally restarts the preparation sequence, which is
-    // fatal mid-session.
-    if (obj.TOKEN_CMD_ORIGIN == "TOKEN_CMD_API_DISPLAY_SET_ROTATION") {
-        //check the return code
-        var ret = obj.TOKEN_PARAM_RETURN_CODE;
-        if (ret < 0) {
-            logResponseError("Failed to set background image", obj);
-            close_pad();
-            return;
-        }
-
-        //get display dotation
-        preparationState = preparationStates.getDisplayRotation;
-        api_signature_start();
-    }
-    else if (obj.TOKEN_CMD_ORIGIN == "TOKEN_CMD_API_DISPLAY_GET_ROTATION") {
-        var rotation = 0;
-        //check the return code
-        var ret = obj.TOKEN_PARAM_RETURN_CODE;
-        if (ret < 0) {
-            logResponseError("Failed to set background image", obj);
-            close_pad();
-            return;
-        }
-
-        rotation = obj.TOKEN_PARAM_RETURN_CODE;
-
-        //set background target
-        preparationState = preparationStates.setBackgroundTarget;
-        api_signature_start();
-    }
-    else if (obj.TOKEN_CMD_ORIGIN == "TOKEN_CMD_API_DISPLAY_SET_TARGET") {
-        //check the return code
-        var ret = obj.TOKEN_PARAM_RETURN_CODE;
-        if (ret < 0) {
-            logResponseError("Failed to set display target", obj);
-            close_pad();
-            return;
-        }
-
-        // set an image
-        switch (preparationState) {
-            case preparationStates.setBackgroundTarget:
-                //set background image
-                preparationState = preparationStates.setBackgroundImage;
-                break;
-
-            case preparationStates.setForegroundTarget:
-                //switch buffers to display dialog
-                preparationState = preparationStates.switchBuffers;
-                break;
-
-            default:
-                preparationState = preparationStates.setDisplayRotation;
-                //alert("invalid preparationState");
-                return;
-        }
-
-        api_signature_start();
-    }
-    else if (obj.TOKEN_CMD_ORIGIN == "TOKEN_CMD_API_DISPLAY_SET_IMAGE") {
-        //check the return code
-        var ret = obj.TOKEN_PARAM_RETURN_CODE;
-        if (ret < 0) {
-            logResponseError("Failed to set background image", obj);
-            close_pad();
-            return;
-        }
-
-        //set cancel button
-        preparationState = preparationStates.setCancelButton;
-        api_signature_start();
-    }
-    else if (obj.TOKEN_CMD_ORIGIN == "TOKEN_CMD_API_SENSOR_ADD_HOT_SPOT") {
-        //check the return code
-        var ret = obj.TOKEN_PARAM_RETURN_CODE;
-        if (ret < 0) {
-            logResponseError("Failed to add button", obj);
-            close_pad();
-            return;
-        }
-
-        // set the buttons
-        switch (preparationState) {
-            case preparationStates.setCancelButton:
-                cancelButton = ret;
-                // set retry button
-                preparationState = preparationStates.setRetryButton;
-                break;
-
-            case preparationStates.setRetryButton:
-                retryButton = ret;
-                // set confirm button
-                preparationState = preparationStates.setConfirmButton;
-                break;
-
-            case preparationStates.setConfirmButton:
-                confirmButton = ret;
-                // set signature rectangle
-                preparationState = preparationStates.setSignRect;
-                break;
-
-            default:
-                preparationState = preparationStates.setDisplayRotation;
-                //alert("invalid preparationState");
-                return;
-        }
-
-        api_signature_start();
-    }
-    else if (obj.TOKEN_CMD_ORIGIN == "TOKEN_CMD_API_SENSOR_SET_SIGN_RECT") {
-        //check the return code
-        var ret = obj.TOKEN_PARAM_RETURN_CODE;
-        if (ret < 0) {
-            logResponseError("Failed to set signature rectangle", obj);
-            close_pad();
-            return;
-        }
-
-        // set field name
-        preparationState = preparationStates.setFieldName;
-        api_signature_start();
-    }
-    else if (obj.TOKEN_CMD_ORIGIN == "TOKEN_CMD_API_DISPLAY_SET_TEXT_IN_RECT") {
-        //check the return code
-        var ret = obj.TOKEN_PARAM_RETURN_CODE;
-        if (ret < 0) {
-            logResponseError("Failed to set text", obj);
-            close_pad();
-            return;
-        }
-
-        switch (preparationState) {
-            case preparationStates.setFieldName:
-                // set custom text
-                preparationState = preparationStates.setCustomText;
-                break;
-
-            case preparationStates.setCustomText:
-                // set foreground target
-                preparationState = preparationStates.setForegroundTarget;
-                break;
-
-            default:
-                preparationState = preparationStates.setDisplayRotation;
-                //alert("invalid preparationState");
-                return;
-        }
-
-        api_signature_start();
-    }
-    else if (obj.TOKEN_CMD_ORIGIN == "TOKEN_CMD_API_DISPLAY_SET_IMAGE_FROM_STORE") {
-        //check the return code
-        var ret = obj.TOKEN_PARAM_RETURN_CODE;
-        if (ret < 0) {
-            logResponseError("Failed to switch buffers", obj);
-            close_pad();
-            return;
-        }
-
-        //start signing process
-        preparationState = preparationStates.startSignature;
-        api_signature_start();
-    }
-    else if (obj.TOKEN_CMD_ORIGIN == "TOKEN_CMD_API_SIGNATURE_START") {
-        //check the return code
-        var ret = obj.TOKEN_PARAM_RETURN_CODE;
-        if (ret < 0) {
-            logResponseError("Failed to start signing process", obj);
-            close_pad();
-            return;
-        }
-
-        // reset preparationState
-        preparationState = preparationStates.setDisplayRotation;
-    }
-    else {
-        // do nothing
-    }
+function addHotSpotMessage(left, profile) {
+    return '{"TOKEN_TYPE":"TOKEN_TYPE_REQUEST", "TOKEN_CMD":"TOKEN_CMD_API_SENSOR_ADD_HOT_SPOT"' +
+        ', "TOKEN_PARAM_LEFT":"' + Math.round(left) +
+        '", "TOKEN_PARAM_TOP":"' + profile.buttonTop +
+        '", "TOKEN_PARAM_WIDTH":"' + profile.buttonSize +
+        '", "TOKEN_PARAM_HEIGHT":"' + profile.buttonSize + '" }';
 }
-// api signature start end
-// getSignatureAPI end
 
-// selection dialog begin
-// TOKEN_CMD_SELECTION_DIALOG
-function selection_dialog() {
-    if (padMode == padModes.Default) {
-        // default mode
-        var selectedElement = document.getElementById("check_boxes_selectedElements").value;
-        if (selectedElement > 0) {
-            var message = '{"TOKEN_TYPE": "TOKEN_TYPE_REQUEST",' +
-                '"TOKEN_CMD": "TOKEN_CMD_SELECTION_DIALOG",' +
-                '"TOKEN_PARAM_FIELD_LIST": [';
-            for (i = 1; i <= selectedElement; i++) {
-                message += '{"TOKEN_PARAM_FIELD_ID": "' + document.getElementById("fieldID" + i).value + '", ' +
-                    '"TOKEN_PARAM_FIELD_TEXT": "' + document.getElementById("fieldText" + i).value + '", ' +
-                    '"TOKEN_PARAM_FIELD_CHECKED": "' + document.getElementById("fieldChecked" + i).checked + '", ' +
-                    '"TOKEN_PARAM_FIELD_REQUIRED": "' + document.getElementById("fieldRequired" + i).checked + '"}';
-                if (i < selectedElement) {
-                    message += ', ';
-                }
-            }
-            message += ']}';
-            signoPADAPIWeb.send(message);
-            logMessage(message);
-        }
-        else {
-            // start signature capture
-            signature_start();
-        }
-    }
-    else if (padMode == padModes.API) {
-        // API mode
-        // do nothing
-    }
-    else {
-        //alert("invalid padMode");
+function onSetRotationResponse(obj) {
+    if (failed(obj, "failed to set the display rotation")) {
         return;
     }
+    preparationState = preparationStates.getDisplayRotation;
+    api_signature_start();
 }
 
-function selection_dialog_response(obj) {
-    if (obj.TOKEN_CMD_ORIGIN == "TOKEN_CMD_SELECTION_DIALOG") {
-        //check the return code
-        var ret = obj.TOKEN_PARAM_RETURN_CODE;
-        if (ret < 0) {
-            logResponseError("Failed to selection dialog process", obj);
-            close_pad();
-            return;
-        }
+function onGetRotationResponse(obj) {
+    if (failed(obj, "failed to get the display rotation")) {
+        return;
     }
-    else {
-        // do nothing
-    }
+    preparationState = preparationStates.setBackgroundTarget;
+    api_signature_start();
 }
-// selection dialog end
 
-// signature start begin
-// TOKEN_CMD_SIGNATURE_START
-function signature_start() {
-    var message;
-    var dochash;
+function onSetTargetResponse(obj) {
+    if (failed(obj, "failed to set the display target")) {
+        return;
+    }
 
-    switch (docHash) {
-        case docHashes.kSha1:
-            dochash = "AAECAwQFBgcICQoLDA0ODxAREhM=";
+    switch (preparationState) {
+        case preparationStates.setBackgroundTarget:
+            preparationState = preparationStates.setBackgroundImage;
             break;
 
-        case docHashes.kSha256:
-            dochash = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+        case preparationStates.setForegroundTarget:
+            preparationState = preparationStates.switchBuffers;
             break;
 
         default:
-            //alert("unknown doc hash");
+            logMessage("!! unexpected SET_TARGET response in state " + preparationState);
             return;
     }
 
-    if (supportsRSA) {
-        message = '{ "TOKEN_TYPE":"TOKEN_TYPE_REQUEST", "TOKEN_CMD":"TOKEN_CMD_SIGNATURE_START", "TOKEN_PARAM_FIELD_NAME":"' + field_name +
-            '", "TOKEN_PARAM_CUSTOM_TEXT":"' + custom_text +
-            '", "TOKEN_PARAM_PAD_ENCRYPTION":"' + encryption +
-            '", "TOKEN_PARAM_DOCHASH":"' + dochash +
-            '", "TOKEN_PARAM_ENCRYPTION_CERT":"' + encryption_cert +
-            '" }';
-    }
-    else {
-        message = '{ "TOKEN_TYPE":"TOKEN_TYPE_REQUEST", "TOKEN_CMD":"TOKEN_CMD_SIGNATURE_START", "TOKEN_PARAM_FIELD_NAME":"' + field_name +
-            '", "TOKEN_PARAM_CUSTOM_TEXT":"' + custom_text +
-            '" }';
-    }
-    signoPADAPIWeb.send(message);
-    logMessage(message);
+    api_signature_start();
 }
 
-function signature_start_response(obj) {
-    if (obj.TOKEN_CMD_ORIGIN == "TOKEN_CMD_SIGNATURE_START") {
-        //check the return code
-        var ret = obj.TOKEN_PARAM_RETURN_CODE;
-        if (ret < 0) {
-            logResponseError("Failed to start signature process", obj);
-            close_pad();
+function onSetImageResponse(obj) {
+    if (failed(obj, "failed to set the background image")) {
+        return;
+    }
+    if (preparationState !== preparationStates.setBackgroundImage) {
+        logMessage("!! unexpected SET_IMAGE response in state " + preparationState);
+        return;
+    }
+
+    preparationState = preparationStates.setCancelButton;
+    api_signature_start();
+}
+
+function onAddHotSpotResponse(obj) {
+    if (failed(obj, "failed to add a hot spot")) {
+        return;
+    }
+
+    var id = obj.TOKEN_PARAM_RETURN_CODE;
+
+    switch (preparationState) {
+        case preparationStates.setCancelButton:
+            cancelButton = id;
+            preparationState = preparationStates.setRetryButton;
+            break;
+
+        case preparationStates.setRetryButton:
+            retryButton = id;
+            preparationState = preparationStates.setConfirmButton;
+            break;
+
+        case preparationStates.setConfirmButton:
+            confirmButton = id;
+            preparationState = preparationStates.setSignRect;
+            break;
+
+        default:
+            logMessage("!! unexpected ADD_HOT_SPOT response in state " + preparationState);
             return;
+    }
+
+    api_signature_start();
+}
+
+function onSetSignRectResponse(obj) {
+    if (failed(obj, "failed to set the signature rectangle")) {
+        return;
+    }
+    preparationState = preparationStates.setFieldName;
+    api_signature_start();
+}
+
+function onSetTextInRectResponse(obj) {
+    if (failed(obj, "failed to set a text")) {
+        return;
+    }
+
+    switch (preparationState) {
+        case preparationStates.setFieldName:
+            preparationState = preparationStates.setCustomText;
+            break;
+
+        case preparationStates.setCustomText:
+            preparationState = preparationStates.setForegroundTarget;
+            break;
+
+        default:
+            logMessage("!! unexpected SET_TEXT_IN_RECT response in state " + preparationState);
+            return;
+    }
+
+    api_signature_start();
+}
+
+function onSetImageFromStoreResponse(obj) {
+    if (failed(obj, "failed to blit the image store")) {
+        return;
+    }
+    preparationState = preparationStates.startSignature;
+    api_signature_start();
+}
+
+function onSignatureStartResponse(obj) {
+    if (failed(obj, "failed to start the signing process")) {
+        return;
+    }
+
+    preparationState = preparationStates.setDisplayRotation;
+    logMessage("-- ready for signing");
+}
+
+// ---------------------------------------------------------------------------
+// Pad buttons
+// ---------------------------------------------------------------------------
+
+function api_sensor_hot_spot_pressed_send(button) {
+    switch (button) {
+        case cancelButton:
+            signature_cancel_send();
+            break;
+
+        // was a full clear, now removes the last stroke only
+        case retryButton:
+            undo_last_stroke_send();
+            break;
+
+        case confirmButton:
+            signature_confirm_send();
+            break;
+
+        default:
+            logMessage("!! unknown hot spot id " + button);
+    }
+}
+
+// --- Confirm ---------------------------------------------------------------
+
+function signature_confirm_send() {
+    sendMessage('{"TOKEN_TYPE":"TOKEN_TYPE_REQUEST", "TOKEN_CMD":"TOKEN_CMD_API_SIGNATURE_CONFIRM" }');
+}
+
+function onConfirmResponse(obj) {
+    if (failed(obj, "failed to confirm the signature")) {
+        return;
+    }
+    signature_image_from_canvas();
+}
+
+/**
+ * Produces the final PNG from sigCanvas.
+ *
+ * Not from TOKEN_CMD_API_SIGNATURE_SAVE_AS_STREAM_EX or
+ * TOKEN_CMD_API_SIGNATURE_GET_SIGN_DATA: both read the pad's own internal
+ * buffer, which still contains any stroke that was undone. This system has no
+ * legal or biometric use for SignData, so the canvas is the correct source.
+ */
+function signature_image_from_canvas() {
+    lastSignatureImage = (sigcanvas === null) ? null : sigcanvas.toDataURL("image/png");
+
+    if (typeof window !== "undefined") {
+        window.lastSignatureImage = lastSignatureImage;
+    }
+
+    // hand the image to the surrounding application
+    var target = byId("SignatureImageData");
+    if (target !== null) {
+        target.value = lastSignatureImage;
+    }
+
+    logMessage("-- signature confirmed with " + signatureStrokes.length + " stroke(s)");
+
+    clickIfPresent("#signDoc1");
+    clickIfPresent("#fa-close2");
+
+    close_pad();
+}
+
+// --- Cancel ----------------------------------------------------------------
+
+function signature_cancel_send() {
+    hideOverlay();
+    sendMessage('{"TOKEN_TYPE":"TOKEN_TYPE_REQUEST", "TOKEN_CMD":"TOKEN_CMD_API_SIGNATURE_CANCEL"' +
+        ', "TOKEN_PARAM_ERASE":"0" }');
+}
+
+function onCancelResponse(obj) {
+    if (failed(obj, "failed to cancel the signing process")) {
+        return;
+    }
+    resetSignature();
+    close_pad();
+}
+
+// --- jQuery helpers, guarded so a missing element never breaks signing -----
+
+function clickIfPresent(selector) {
+    try {
+        if (typeof $ === "function") {
+            $(selector).click();
         }
-    }
-    else {
-        // do nothing
+    } catch (e) {
+        logMessage("!! click on " + selector + " failed: " + e);
     }
 }
-// signature start end
 
-// close pad begin
-// TOKEN_CMD_CLOSE_PAD and TOKEN_CMD_API_DEVICE_CLOSE
+function hideOverlay() {
+    try {
+        if (typeof $ === "function") {
+            $(".Main_overlay").fadeOut("slow");
+        }
+    } catch (e) { /* the overlay is optional */ }
+}
+
+// ---------------------------------------------------------------------------
+// Close
+// ---------------------------------------------------------------------------
+
 function close_pad() {
-//debugger
-    var message;
-    if (padState == padStates.opened) {
-        if (padMode == padModes.Default) {
-            // default mode
-            message = '{ "TOKEN_TYPE":"TOKEN_TYPE_REQUEST", "TOKEN_CMD":"TOKEN_CMD_CLOSE_PAD", "TOKEN_PARAM_PAD_INDEX":"' + padIndex + '" }';
-        }
-        else if (padMode == padModes.API) {
-            // API mode
-            message = '{ "TOKEN_TYPE":"TOKEN_TYPE_REQUEST", "TOKEN_CMD":"TOKEN_CMD_API_DEVICE_CLOSE", "TOKEN_PARAM_INDEX":"' + padIndex + '" }';
-        }
-        else {
-            //alert("invalid padMode");
-            return;
-        }
-        signoPADAPIWeb.send(message);
-        logMessage(message);
-    }
-}
+    // drop any queued re-sync first, so undoSync_finish() cannot start a new
+    // repaint while the pad is on its way out
+    undoResyncPending = false;
+    undoSync_finish();
 
-function close_pad_response(obj) {
-    // close default and api pad
-    if ((obj.TOKEN_CMD_ORIGIN == "TOKEN_CMD_CLOSE_PAD") || (obj.TOKEN_CMD_ORIGIN == "TOKEN_CMD_API_DEVICE_CLOSE")) {
-        searchState = searchStates.setPadType;
-        openState = openStates.openPad;
-        preparationState = preparationStates.setDisplayRotation;
-        if (padState != padStates.closed) {
-            //check the return code
-            var ret = obj.TOKEN_PARAM_RETURN_CODE;
-            if (ret < 0) {
-                //alert("Failed to close pad. Reason: " + obj.TOKEN_PARAM_ERROR_DESCRIPTION);
-                return;
-            }
-        }
-
-        padState = padStates.closed;
-    }
-    else {
-        // do nothing
-    }
-}
-// close pad end
-
-function getBackgroundImage(padName) {
-    var img = new Image();
-    img.setAttribute('crossOrigin', 'anonymous');
-    img.onload = function () {
-        var sigcanvas = document.createElement("canvas");
-        sigcanvas.width = this.width;
-        sigcanvas.height = this.height;
-
-        var ctx = sigcanvas.getContext("2d");
-        ctx.drawImage(this, 0, 0);
-
-        var dataURL = sigcanvas.toDataURL("image/png");
-        backgroundImage = dataURL.replace(/^data:image\/(png|jpg);base64,/, "");
-        // keep a pristine copy: Undo always composites strokes onto this
-        // ORIGINAL template, never onto a previous composite, so nothing
-        // ever accumulates or gets double-drawn
-        originalBackgroundImage = backgroundImage;
-    };
-    var element = document.getElementById(padName);
-    img.src = element.src;
-}
-
-function check_boxes_selectedElements_onchange() {
-    var sender = document.getElementById("check_boxes_selectedElements");
-    var selectedElem = sender.value;
-    var elemCount = sender.childElementCount;
-
-    for (i = 1; i < elemCount; i++) {
-        document.getElementById("fieldNumber" + i).style.visibility = 'hidden';
-        document.getElementById("fieldID" + i).style.visibility = 'hidden';
-        document.getElementById("fieldText" + i).style.visibility = 'hidden';
-        document.getElementById("fieldChecked" + i).style.visibility = 'hidden';
-        document.getElementById("fieldRequired" + i).style.visibility = 'hidden';
+    if (padState !== padStates.opened) {
+        return;
     }
 
-    for (i = 1; i <= selectedElem; i++) {
-        document.getElementById("fieldNumber" + i).style.visibility = 'visible';
-        document.getElementById("fieldID" + i).style.visibility = 'visible';
-        document.getElementById("fieldText" + i).style.visibility = 'visible';
-        document.getElementById("fieldChecked" + i).style.visibility = 'visible';
-        document.getElementById("fieldRequired" + i).style.visibility = 'visible';
+    sendMessage('{"TOKEN_TYPE":"TOKEN_TYPE_REQUEST", "TOKEN_CMD":"TOKEN_CMD_API_DEVICE_CLOSE"' +
+        ', "TOKEN_PARAM_INDEX":"' + padIndex + '" }');
+}
+
+function onDeviceCloseResponse(obj) {
+    resetPipelineState();
+
+    if (obj.TOKEN_PARAM_RETURN_CODE < 0) {
+        logResponseError("failed to close the pad", obj);
     }
+
+    padState = padStates.closed;
 }
 
-function ModeListName_onchange() {
-    //var sender = document.getElementById("ModeList");
-    var selectedElem = "API";
+// ---------------------------------------------------------------------------
+// Events pushed by the pad
+// ---------------------------------------------------------------------------
 
-    // the signature pen color select
-    //var scl = 1;
-    var spcs = document.getElementById("signaturePenColorSelect");
-    spcs.selectedIndex = 0;
+function disconnect_send(index) {
+    logMessage("!! the pad (index " + index + ") has been disconnected");
 
-    // the check boxes select
-    var cbsEL = document.getElementById("check_boxes_selectedElementsLabel");
-    var cbsE = document.getElementById("check_boxes_selectedElements");
-    var elemCount = cbsE.childElementCount;
-
-    switch (selectedElem) {
-        case MODE_LIST_DEFAULT:
-            // disable the signature pen color select
-            //scl.disabled = true;
-            spcs.disabled = true;
-
-            // enable the check boxes select and table elements
-            cbsEL.disabled = false;
-            cbsE.disabled = false;
-            for (i = 1; i < elemCount; i++) {
-                document.getElementById("fieldNumber" + i).disabled = false;
-                document.getElementById("fieldID" + i).disabled = false;
-                document.getElementById("fieldText" + i).disabled = false;
-                document.getElementById("fieldChecked" + i).disabled = false;
-                document.getElementById("fieldRequired" + i).disabled = false;
-            }
-            padMode = padModes.Default;
-            break;
-
-        case MODE_LIST_API:
-            // enable the signature pen color select
-            //scl.disabled = false;
-            spcs.disabled = false;
-
-            // disable the check boxes select and table elements
-            cbsEL.disabled = true;
-            cbsE.disabled = true;
-            for (i = 1; i < elemCount; i++) {
-                document.getElementById("fieldNumber" + i).disabled = true;
-                document.getElementById("fieldID" + i).disabled = true;
-                document.getElementById("fieldText" + i).disabled = true;
-                document.getElementById("fieldChecked" + i).disabled = true;
-                document.getElementById("fieldRequired" + i).disabled = true;
-            }
-            padMode = padModes.API;
-            break;
-
-        default:
-            //alert("invalid padMode");
-            break;
-    }
+    resetPipelineState();
+    undoResyncPending = false;
+    undoSync_finish();
+    padState = padStates.closed;
 }
 
-function getReadableType(intTypeNumber) {
-    switch (intTypeNumber) {
-        case padTypes.sigmaUSB:
-            return "Sigma USB";
-        case padTypes.sigmaSerial:
-            return "Sigma seriell";
-        case padTypes.omegaUSB:
-            return "Omega USB";
-        case padTypes.omegaSerial:
-            return "Omega seriell";
-        case padTypes.gammaUSB:
-            return "Gamma USB";
-        case padTypes.gammaSerial:
-            return "Gamma seriell";
-        case padTypes.deltaUSB:
-            return "Delta USB";
-        case padTypes.deltaSerial:
-            return "Delta seriell";
-        case padTypes.deltaIP:
-            return "Delta IP";
-        case padTypes.alphaUSB:
-            return "Alpha USB";
-        case padTypes.alphaSerial:
-            return "Alpha seriell";
-        case padTypes.alphaIP:
-            return "Alpha IP";
-        default:
-            return "Unknown";
-    }
+function error_send(context, returnCode, description) {
+    logMessage("!! pad error | context=" + context +
+        " | TOKEN_PARAM_RETURN_CODE=" + returnCode +
+        " | TOKEN_PARAM_ERROR_DESCRIPTION=" + description);
 }
 
-function clearSignature() {
-    //document.getElementById("ModeList").selectedIndex = 0;
-    //document.getElementById("PadConnectionTypeList").selectedIndex = 0;
-    //document.getElementById("SignData_0").value = "";
+function api_display_scroll_pos_changed_send(xPos, yPos) {
+    logMessage("-- scroll position " + xPos + "," + yPos);
 }
+
+// ---------------------------------------------------------------------------
+// Message dispatch
+// ---------------------------------------------------------------------------
+//
+// Each response goes to exactly one handler. The old code ran every handler
+// for every response, which is how the Undo repaint's replies ended up
+// restarting the preparation sequence and closing the pad.
+
+var responseHandlers = {
+    TOKEN_CMD_API_DEVICE_SET_COM_PORT: onSetComPortResponse,
+    TOKEN_CMD_API_DEVICE_GET_COUNT: onGetCountResponse,
+    TOKEN_CMD_API_DEVICE_GET_INFO: onGetInfoResponse,
+    TOKEN_CMD_API_DEVICE_GET_VERSION: onGetVersionResponse,
+
+    TOKEN_CMD_API_DEVICE_OPEN: onDeviceOpenResponse,
+    TOKEN_CMD_API_DISPLAY_CONFIG_PEN: onConfigPenResponse,
+    TOKEN_CMD_API_DISPLAY_GET_WIDTH: onGetDisplayWidthResponse,
+    TOKEN_CMD_API_DISPLAY_GET_HEIGHT: onGetDisplayHeightResponse,
+    TOKEN_CMD_API_SIGNATURE_GET_RESOLUTION: onGetResolutionResponse,
+
+    TOKEN_CMD_API_DISPLAY_SET_ROTATION: onSetRotationResponse,
+    TOKEN_CMD_API_DISPLAY_GET_ROTATION: onGetRotationResponse,
+    TOKEN_CMD_API_DISPLAY_SET_TARGET: onSetTargetResponse,
+    TOKEN_CMD_API_DISPLAY_SET_IMAGE: onSetImageResponse,
+    TOKEN_CMD_API_SENSOR_ADD_HOT_SPOT: onAddHotSpotResponse,
+    TOKEN_CMD_API_SENSOR_SET_SIGN_RECT: onSetSignRectResponse,
+    TOKEN_CMD_API_DISPLAY_SET_TEXT_IN_RECT: onSetTextInRectResponse,
+    TOKEN_CMD_API_DISPLAY_SET_IMAGE_FROM_STORE: onSetImageFromStoreResponse,
+    TOKEN_CMD_API_SIGNATURE_START: onSignatureStartResponse,
+
+    TOKEN_CMD_API_SIGNATURE_CONFIRM: onConfirmResponse,
+    TOKEN_CMD_API_SIGNATURE_CANCEL: onCancelResponse,
+    TOKEN_CMD_API_DEVICE_CLOSE: onDeviceCloseResponse
+};
 
 function onMessage(event) {
+    logMessage("<< " + event.data);
 
-    
-
-    logMessage(event.data);
-
-    var obj = JSON.parse(event.data);
-
-    // The Undo repaint state machine gets FIRST refusal on every response.
-    // If it owns the response we return immediately, so it can never reach
-    // the preparation handlers below (api_signature_start_responses() would
-    // otherwise treat our SET_IMAGE/SET_TARGET replies as part of the
-    // one-time prep sequence and restart it mid-session -- the actual cause
-    // of the blank screen + closed session seen previously).
-    if (obj.TOKEN_TYPE == "TOKEN_TYPE_RESPONSE" && undoSync_handleResponse(obj)) {
+    var obj;
+    try {
+        obj = JSON.parse(event.data);
+    } catch (e) {
+        logMessage("!! could not parse the message: " + e);
         return;
     }
 
-    if (obj.TOKEN_TYPE == "TOKEN_TYPE_SEND") {
-
-        // the send events
-
-        switch (obj.TOKEN_CMD) {
-            case "TOKEN_CMD_SELECTION_CONFIRM":
-                // confirm selecting process
-                selection_confirm_send();
-                break;
-            case "TOKEN_CMD_SELECTION_CHANGE":
-                // change selecting process
-                selection_change_send(obj.TOKEN_PARAM_FIELD_ID, obj.TOKEN_PARAM_FIELD_CHECKED);
-                break;
-            case "TOKEN_CMD_SELECTION_CANCEL":
-                // cancel selecting process
-                selection_cancel_send();
-                break;
-            case "TOKEN_CMD_SIGNATURE_CONFIRM":
-                // confirm signing process
-                signature_confirm_send();
-                break;
-            case "TOKEN_CMD_SIGNATURE_RETRY":
-                // restart signing process
-                signature_retry_send();
-                break;
-            case "TOKEN_CMD_SIGNATURE_CANCEL":
-                // cancel signing process
-                signature_cancel_send();
-                break;
-            case "TOKEN_CMD_SIGNATURE_POINT":
-                // draw the points
-                signature_point_send(obj.TOKEN_PARAM_POINT.x, obj.TOKEN_PARAM_POINT.y, obj.TOKEN_PARAM_POINT.p)
-                break;
-            case "TOKEN_CMD_DISCONNECT":
-                //the opened pad has been disconnected
-                disconnect_send(obj.TOKEN_PARAM_PAD_INDEX)
-                break;
-            case "TOKEN_CMD_ERROR":
-                // an error has happened
-                error_send(obj.TOKEN_PARAM_ERROR_CONTEXT, obj.TOKEN_PARAM_RETURN_CODE, obj.TOKEN_PARAM_ERROR_DESCRIPTION);
-                break;
-            case "TOKEN_CMD_API_SENSOR_HOT_SPOT_PRESSED":
-                // a hot spot has been pressed
-                api_sensor_hot_spot_pressed_send(obj.TOKEN_PARAM_HOTSPOT_ID);
-                break;
-            case "TOKEN_CMD_API_DISPLAY_SCROLL_POS_CHANGED":
-                // the display scroll pos was changed
-                api_display_scroll_pos_changed_send(obj.TOKEN_PARAM_X_POS, obj.TOKEN_PARAM_Y_POS);
-                break;
-            default:
-                //alert("Unknown token for send events. Token: " + obj.TOKEN_CMD);
-                break;
-        }
-    }
-    else if (obj.TOKEN_TYPE == "TOKEN_TYPE_RESPONSE") {
-
-        // the responses for requests
-
-        switch (obj.TOKEN_CMD_ORIGIN) {
-            case "TOKEN_CMD_SEARCH_FOR_PADS":
-            case "TOKEN_CMD_OPEN_PAD":
-            case "TOKEN_CMD_SIGNATURE_START":
-
-            case "TOKEN_CMD_API_DEVICE_SET_COM_PORT":
-            case "TOKEN_CMD_API_DEVICE_GET_COUNT":
-            case "TOKEN_CMD_API_DEVICE_GET_INFO":
-            case "TOKEN_CMD_API_DEVICE_GET_VERSION":
-
-            case "TOKEN_CMD_API_DEVICE_OPEN":
-            case "TOKEN_CMD_API_DISPLAY_CONFIG_PEN":
-            case "TOKEN_CMD_API_DISPLAY_GET_WIDTH":
-            case "TOKEN_CMD_API_DISPLAY_GET_HEIGHT":
-            case "TOKEN_CMD_API_SIGNATURE_GET_RESOLUTION":
-
-            case "TOKEN_CMD_API_DISPLAY_SET_ROTATION":
-            case "TOKEN_CMD_API_DISPLAY_GET_ROTATION":
-            case "TOKEN_CMD_API_DISPLAY_SET_TARGET":
-            case "TOKEN_CMD_API_DISPLAY_SET_IMAGE":
-            case "TOKEN_CMD_API_SENSOR_ADD_HOT_SPOT":
-            case "TOKEN_CMD_API_SENSOR_SET_SIGN_RECT":
-            case "TOKEN_CMD_API_DISPLAY_SET_TEXT_IN_RECT":
-            case "TOKEN_CMD_API_DISPLAY_SET_IMAGE_FROM_STORE":
-            case "TOKEN_CMD_API_SIGNATURE_START":
-
-            case "TOKEN_CMD_SIGNATURE_CONFIRM":
-            case "TOKEN_CMD_API_SIGNATURE_CONFIRM":
-            case "TOKEN_CMD_SIGNATURE_RETRY":
-            case "TOKEN_CMD_API_SIGNATURE_RETRY":
-            case "TOKEN_CMD_SIGNATURE_CANCEL":
-            case "TOKEN_CMD_API_SIGNATURE_CANCEL":
-            case "TOKEN_CMD_SIGNATURE_IMAGE":
-            case "TOKEN_CMD_API_SIGNATURE_SAVE_AS_STREAM_EX":
-            case "TOKEN_CMD_SIGNATURE_SIGN_DATA":
-            case "TOKEN_CMD_API_SIGNATURE_GET_SIGN_DATA":
-            case "TOKEN_CMD_CLOSE_PAD":
-            case "TOKEN_CMD_API_DEVICE_CLOSE":
-
-            case "TOKEN_CMD_SELECTION_DIALOG":
-//debugger
-                // responses from default pad
-                search_for_pads_response(obj);
-                open_pad_response(obj);
-                signature_start_response(obj);
-
-                // responses from api pad
-                api_search_for_pads_responses(obj);
-                api_device_open_responses(obj);
-                api_signature_start_responses(obj);
-
-                // responses from both pads
-                signature_confirm_response(obj);
-                signature_retry_response(obj);
-                signature_cancel_response(obj);
-                signature_image_response(obj);
-                signature_sign_data_response(obj);
-                close_pad_response(obj);
-
-                // responses from selection dialog
-                selection_dialog_response(obj);
-
-                break;
-            default:
-                //alert("Unknown response token. Token: " + obj.TOKEN_CMD_ORIGIN);
-                break;
-        }
-    }
-    else {
-        //alert("Unknown type token. Token: " + obj.TOKEN_TYPE);
+    if (obj.TOKEN_TYPE === "TOKEN_TYPE_SEND") {
+        handleSendEvent(obj);
+    } else if (obj.TOKEN_TYPE === "TOKEN_TYPE_RESPONSE") {
+        handleResponse(obj);
+    } else {
+        logMessage("!! unknown TOKEN_TYPE " + obj.TOKEN_TYPE);
     }
 }
+
+function handleResponse(obj) {
+    // The Undo state machine gets first refusal, so its own SET_TARGET /
+    // SET_IMAGE / SET_TEXT_IN_RECT replies never reach the preparation
+    // handlers above.
+    if (undoSync_handleResponse(obj)) {
+        return;
+    }
+
+    var handler = responseHandlers[obj.TOKEN_CMD_ORIGIN];
+    if (handler === undefined) {
+        logMessage("!! unhandled response " + obj.TOKEN_CMD_ORIGIN);
+        return;
+    }
+
+    handler(obj);
+}
+
+function handleSendEvent(obj) {
+    switch (obj.TOKEN_CMD) {
+        case "TOKEN_CMD_SIGNATURE_POINT":
+            signature_point_send(obj.TOKEN_PARAM_POINT.x,
+                                 obj.TOKEN_PARAM_POINT.y,
+                                 obj.TOKEN_PARAM_POINT.p);
+            break;
+
+        case "TOKEN_CMD_API_SENSOR_HOT_SPOT_PRESSED":
+            api_sensor_hot_spot_pressed_send(obj.TOKEN_PARAM_HOTSPOT_ID);
+            break;
+
+        case "TOKEN_CMD_API_DISPLAY_SCROLL_POS_CHANGED":
+            api_display_scroll_pos_changed_send(obj.TOKEN_PARAM_X_POS, obj.TOKEN_PARAM_Y_POS);
+            break;
+
+        case "TOKEN_CMD_DISCONNECT":
+            disconnect_send(obj.TOKEN_PARAM_PAD_INDEX);
+            break;
+
+        case "TOKEN_CMD_ERROR":
+            error_send(obj.TOKEN_PARAM_ERROR_CONTEXT,
+                       obj.TOKEN_PARAM_RETURN_CODE,
+                       obj.TOKEN_PARAM_ERROR_DESCRIPTION);
+            break;
+
+        // Sent by the pad's own dialog buttons rather than our hot spots.
+        // They should not occur in API mode; mapped anyway so a firmware that
+        // does send them still behaves correctly.
+        case "TOKEN_CMD_SIGNATURE_CONFIRM":
+            signature_confirm_send();
+            break;
+
+        case "TOKEN_CMD_SIGNATURE_RETRY":
+            undo_last_stroke_send();
+            break;
+
+        case "TOKEN_CMD_SIGNATURE_CANCEL":
+            signature_cancel_send();
+            break;
+
+        default:
+            logMessage("!! unknown send event " + obj.TOKEN_CMD);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Compatibility with the surrounding page
+// ---------------------------------------------------------------------------
+//
+// This file no longer implements the pad's Default mode: the whole pipeline
+// runs through the API commands, the mode selector is gone, and the Default
+// mode selection dialog is unused. The entry points below are kept because
+// the HTML may still reference them from inline handlers, and an undefined
+// function there would raise a script error.
+
+function clearSignature() {
+    resetSignature();
+}
+
+/** Selection dialog fields; Default mode only, so nothing is shown. */
+function check_boxes_selectedElements_onchange() {
+    var select = byId("check_boxes_selectedElements");
+    if (select === null) {
+        return;
+    }
+
+    var prefixes = ["fieldNumber", "fieldID", "fieldText", "fieldChecked", "fieldRequired"];
+    var count = select.childElementCount;
+
+    for (var i = 1; i < count; i++) {
+        for (var p = 0; p < prefixes.length; p++) {
+            var el = byId(prefixes[p] + i);
+            if (el !== null) {
+                el.style.visibility = "hidden";
+            }
+        }
+    }
+}
+
+/** The pad always runs in API mode now; kept as a no-op for inline handlers. */
+function ModeListName_onchange() {
+    var penColorSelect = byId("signaturePenColorSelect");
+    if (penColorSelect !== null) {
+        penColorSelect.disabled = false;
+    }
+}
+
+// Elements the page starts with hidden.
+(function hideOptionalElements() {
+    try {
+        if (typeof $ !== "function") {
+            return;
+        }
+        $("#verify").hide();
+        $("#certificateName").hide();
+        $("#barCode").hide();
+        $("#signNow").hide();
+    } catch (e) { /* these elements are optional */ }
+}());
