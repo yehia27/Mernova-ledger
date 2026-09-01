@@ -50,11 +50,30 @@ var PAD_CUSTOM_TEXT = "Please sign!";
 // because it is built from sigCanvas.
 var UNDO_SYNC_TO_PAD = true;
 
-// Send SIGNATURE_RETRY before the repaint (true) or after it (false).
-// If the pad screen ends up blank, try flipping this to false.
-var UNDO_RETRY_FIRST = true;
+// How the remaining strokes are put back on the pad screen.
+//
+//   "direct" (default) - SET_TARGET(0) then SET_IMAGE straight onto the live
+//                        display, followed by the two labels. Four commands,
+//                        and the pixels we send are the pixels shown.
+//   "store"            - render into image store UNDO_STORE_ID, then blit it
+//                        with SET_IMAGE_FROM_STORE. Six commands. Use this if
+//                        the firmware refuses SET_IMAGE on the live display.
+var UNDO_REPAINT_MODE = "direct";
+
+// Whether TOKEN_CMD_API_SIGNATURE_RETRY is sent at all.
+//
+//   "none" (default) - never sent. The repaint already overwrites the undone
+//                      stroke, and this file never reads the firmware's own
+//                      stroke buffer: the saved image comes from sigCanvas.
+//                      RETRY also clears the pad screen itself, and that clear
+//                      can land AFTER our repaint and wipe it, which shows up
+//                      as "Retry erased everything".
+//   "before"         - RETRY first, then repaint.
+//   "after"          - repaint, then RETRY.
+var UNDO_RETRY_MODE = "none";
 
 // Image store the preparation sequence renders into and blits from.
+// Only used when UNDO_REPAINT_MODE is "store".
 var UNDO_STORE_ID = 1;
 
 // Give up on a step if the pad does not answer within this long.
@@ -144,12 +163,12 @@ var padStates = {
 var undoStates = {
     idle: 0,
     retry: 1,
-    setStoreTarget: 2,
-    setStoreImage: 3,
-    setFieldText: 4,
-    setCustomText: 5,
-    setDisplayTarget: 6,
-    blitStore: 7
+    setStoreTarget: 2,      // SET_TARGET -> the off-screen store
+    setDisplayTarget: 3,    // SET_TARGET -> the live display
+    setImage: 4,            // SET_IMAGE with the composite
+    setFieldText: 5,
+    setCustomText: 6,
+    blitStore: 7            // SET_IMAGE_FROM_STORE, "store" mode only
 };
 
 // ---------------------------------------------------------------------------
@@ -732,16 +751,23 @@ function signature_point_send(x, y, p) {
 //   2. Nothing in the Undo path calls close_pad(). On error it abandons the
 //      screen sync only; the session survives and the saved image stays
 //      correct because it comes from sigCanvas.
-//   3. The repaint never writes a bitmap to the live display. It renders into
-//      image store 1 and blits it with SET_IMAGE_FROM_STORE, exactly the
-//      mechanism the preparation sequence already uses:
+//   3. SIGNATURE_RETRY is not sent at all by default (UNDO_RETRY_MODE).
+//      RETRY clears the pad screen itself, and that clear can land after our
+//      repaint and wipe it, which looks exactly like "Retry erased
+//      everything". We never need it: the repaint already covers the undone
+//      stroke, and this file never reads the firmware's stroke buffer, since
+//      the saved image comes from sigCanvas.
 //
-//        SIGNATURE_RETRY          drop the strokes the firmware captured
-//        SET_TARGET      -> 1     off-screen store
+// The repaint itself, with the default UNDO_REPAINT_MODE of "direct":
+//
+//        SET_TARGET      -> 0     live display
 //        SET_IMAGE                template + remaining strokes
 //        SET_TEXT_IN_RECT x2      the two labels
-//        SET_TARGET      -> 0     live display
-//        SET_IMAGE_FROM_STORE     firmware-native blit, no payload
+//
+// Setting UNDO_REPAINT_MODE to "store" renders into image store 1 first and
+// blits it with SET_IMAGE_FROM_STORE instead, the mechanism the preparation
+// sequence uses. Use it if the firmware refuses SET_IMAGE on the live
+// display.
 
 function undo_last_stroke_send() {
     if (signatureStrokes.length === 0) {
@@ -762,20 +788,34 @@ function undo_last_stroke_send() {
 }
 
 function undoSync_orderedStates() {
-    var sequence = [
-        undoStates.setStoreTarget,
-        undoStates.setStoreImage,
-        undoStates.setFieldText,
-        undoStates.setCustomText,
-        undoStates.setDisplayTarget,
-        undoStates.blitStore
-    ];
+    var sequence;
 
-    if (UNDO_RETRY_FIRST) {
-        sequence.unshift(undoStates.retry);
+    if (UNDO_REPAINT_MODE === "store") {
+        // render off-screen, then blit the finished store onto the display
+        sequence = [
+            undoStates.setStoreTarget,
+            undoStates.setImage,
+            undoStates.setFieldText,
+            undoStates.setCustomText,
+            undoStates.setDisplayTarget,
+            undoStates.blitStore
+        ];
     } else {
+        // paint straight onto the live display
+        sequence = [
+            undoStates.setDisplayTarget,
+            undoStates.setImage,
+            undoStates.setFieldText,
+            undoStates.setCustomText
+        ];
+    }
+
+    if (UNDO_RETRY_MODE === "before") {
+        sequence.unshift(undoStates.retry);
+    } else if (UNDO_RETRY_MODE === "after") {
         sequence.push(undoStates.retry);
     }
+
     return sequence;
 }
 
@@ -787,9 +827,9 @@ function undoSync_messageFor(state) {
             return '{"TOKEN_TYPE":"TOKEN_TYPE_REQUEST", "TOKEN_CMD":"TOKEN_CMD_API_SIGNATURE_RETRY" }';
 
         case undoStates.setStoreTarget:
-            return displaySetTargetMessage(1);
+            return displaySetTargetMessage(UNDO_STORE_ID);
 
-        case undoStates.setStoreImage:
+        case undoStates.setImage:
             return displaySetImageMessage(undoCompositeImage);
 
         case undoStates.setFieldText:
@@ -815,10 +855,10 @@ function undoSync_expectedOrigin(state) {
     switch (state) {
         case undoStates.retry: return "TOKEN_CMD_API_SIGNATURE_RETRY";
         case undoStates.setStoreTarget: return "TOKEN_CMD_API_DISPLAY_SET_TARGET";
-        case undoStates.setStoreImage: return "TOKEN_CMD_API_DISPLAY_SET_IMAGE";
+        case undoStates.setDisplayTarget: return "TOKEN_CMD_API_DISPLAY_SET_TARGET";
+        case undoStates.setImage: return "TOKEN_CMD_API_DISPLAY_SET_IMAGE";
         case undoStates.setFieldText: return "TOKEN_CMD_API_DISPLAY_SET_TEXT_IN_RECT";
         case undoStates.setCustomText: return "TOKEN_CMD_API_DISPLAY_SET_TEXT_IN_RECT";
-        case undoStates.setDisplayTarget: return "TOKEN_CMD_API_DISPLAY_SET_TARGET";
         case undoStates.blitStore: return "TOKEN_CMD_API_DISPLAY_SET_IMAGE_FROM_STORE";
         default: return null;
     }
@@ -864,7 +904,8 @@ function undoSync_start() {
         undoCompositeImage = compositeBase64;
         undoSequence = undoSync_orderedStates();
         undoSequenceIndex = -1;
-        logMessage("-- undo sync start (retryFirst=" + UNDO_RETRY_FIRST + ")");
+        logMessage("-- undo sync start (repaint=" + UNDO_REPAINT_MODE +
+            ", retry=" + UNDO_RETRY_MODE + ")");
         undoSync_advance();
     });
 }

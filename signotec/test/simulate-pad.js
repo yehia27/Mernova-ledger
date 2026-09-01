@@ -103,11 +103,16 @@ function check(name, cond, detail) {
   if (!cond) fails++;
 }
 const seq = () => JSON.stringify(sent);
-const UNDO_SEQ = JSON.stringify([
-  'TOKEN_CMD_API_SIGNATURE_RETRY', 'TOKEN_CMD_API_DISPLAY_SET_TARGET',
-  'TOKEN_CMD_API_DISPLAY_SET_IMAGE', 'TOKEN_CMD_API_DISPLAY_SET_TEXT_IN_RECT',
-  'TOKEN_CMD_API_DISPLAY_SET_TEXT_IN_RECT', 'TOKEN_CMD_API_DISPLAY_SET_TARGET',
-  'TOKEN_CMD_API_DISPLAY_SET_IMAGE_FROM_STORE']);
+const DIRECT_SEQ = JSON.stringify([
+  'TOKEN_CMD_API_DISPLAY_SET_TARGET', 'TOKEN_CMD_API_DISPLAY_SET_IMAGE',
+  'TOKEN_CMD_API_DISPLAY_SET_TEXT_IN_RECT', 'TOKEN_CMD_API_DISPLAY_SET_TEXT_IN_RECT']);
+const STORE_SEQ = JSON.stringify([
+  'TOKEN_CMD_API_DISPLAY_SET_TARGET', 'TOKEN_CMD_API_DISPLAY_SET_IMAGE',
+  'TOKEN_CMD_API_DISPLAY_SET_TEXT_IN_RECT', 'TOKEN_CMD_API_DISPLAY_SET_TEXT_IN_RECT',
+  'TOKEN_CMD_API_DISPLAY_SET_TARGET', 'TOKEN_CMD_API_DISPLAY_SET_IMAGE_FROM_STORE']);
+const targetsSent = () => logLines
+  .filter(l => l.startsWith('[signotec] >>') && l.includes('DISPLAY_SET_TARGET'))
+  .map(l => l.match(/TARGET":"(\d)"/)[1]).join('');
 
 async function fullSession() {
   sent = []; hotspotId = 0; logLines = []; jqCalls = [];
@@ -134,11 +139,9 @@ async function fullSession() {
   check('3 strokes captured', peek().signatureStrokes.length === 3, 'got ' + peek().signatureStrokes.length);
   sent = []; press(retryButton); await wait(400);
   check('one stroke removed',        peek().signatureStrokes.length === 2, 'got ' + peek().signatureStrokes.length);
-  check('exact 7-command sequence',  seq() === UNDO_SEQ, seq());
-  const targets = logLines.filter(l => l.startsWith('[signotec] >>') && l.includes('DISPLAY_SET_TARGET'))
-                          .map(l => l.match(/TARGET":"(\d)"/)[1]);
-  check('undo writes to store 1, then back to display 0',
-        targets.slice(-2).join('') === '10', 'targets seen: ' + targets.join(''));
+  check('default sends no SIGNATURE_RETRY', !sent.includes('TOKEN_CMD_API_SIGNATURE_RETRY'), seq());
+  check('direct repaint: 4 commands', seq() === DIRECT_SEQ, seq());
+  check('direct repaint targets the live display', targetsSent().slice(-1) === '0', targetsSent());
   check('preparation never re-entered',
         preparationState === prepState && !sent.includes('TOKEN_CMD_API_SENSOR_ADD_HOT_SPOT'), 'state moved');
   check('session still open',        deviceOpen && !sent.includes('TOKEN_CMD_API_DEVICE_CLOSE'), 'closed');
@@ -155,7 +158,7 @@ async function fullSession() {
 
   section('Pad never answers (timeout)');
   const savedTimeout = UNDO_TIMEOUT_MS; UNDO_TIMEOUT_MS = 120;
-  strokeOf(4,400); sent = []; dropReplyFor = 'TOKEN_CMD_API_SIGNATURE_RETRY';
+  strokeOf(4,400); sent = []; dropReplyFor = 'TOKEN_CMD_API_DISPLAY_SET_TARGET';
   press(retryButton); await wait(400);
   check('aborts on timeout',  undoState === undoStates.idle, 'undoState=' + undoState);
   check('timeout is logged',  logLines.some(l => l.includes('timed out')), 'no timeout line');
@@ -168,7 +171,7 @@ async function fullSession() {
   sent = []; press(retryButton); press(retryButton); await wait(600);
   check('both strokes removed', peek().signatureStrokes.length === before - 2, 'got ' + peek().signatureStrokes.length);
   check('two syncs ran, serialised',
-        sent.filter(c => c === 'TOKEN_CMD_API_DISPLAY_SET_IMAGE_FROM_STORE').length === 2, seq());
+        sent.filter(c => c === 'TOKEN_CMD_API_DISPLAY_SET_IMAGE').length === 2, seq());
   check('idle afterwards', undoState === undoStates.idle, 'undoState=' + undoState);
 
   section('Undo down to empty');
@@ -223,6 +226,29 @@ async function fullSession() {
   check('pad closed after a failed command', okOpen && !deviceOpen, 'deviceOpen=' + deviceOpen);
 
   clearTimeout(T);
+  section('UNDO_REPAINT_MODE = "store"');
+  await fullSession();
+  strokeOf(5,100); strokeOf(5,200);
+  UNDO_REPAINT_MODE = 'store';
+  sent = []; logLines = []; press(retryButton); await wait(400);
+  check('store repaint: 6 commands',  seq() === STORE_SEQ, seq());
+  check('renders to store 1 then display 0', targetsSent() === '10', targetsSent());
+  check('one stroke removed',         peek().signatureStrokes.length === 1, 'got ' + peek().signatureStrokes.length);
+  UNDO_REPAINT_MODE = 'direct';
+
+  section('UNDO_RETRY_MODE');
+  for (const [mode, assertion] of [
+        ['before', s => s[0] === 'TOKEN_CMD_API_SIGNATURE_RETRY'],
+        ['after',  s => s[s.length-1] === 'TOKEN_CMD_API_SIGNATURE_RETRY'],
+        ['none',   s => !s.includes('TOKEN_CMD_API_SIGNATURE_RETRY')]]) {
+    strokeOf(5, 300);                       // a stroke to undo for this case
+    UNDO_RETRY_MODE = mode;
+    sent = []; press(retryButton); await wait(400);
+    check(`"${mode}" places RETRY correctly`, assertion(sent), mode + ' -> ' + seq());
+  }
+  UNDO_RETRY_MODE = 'none';
+  press(confirmButton); await wait(300);
+
   section('Connection is opened lazily and sends are queued');
   signoPADAPIWeb = null; sent = []; hotspotId = 0; logLines = []; socketOpenDelay = 60;
   // getSignature() without onMainWindowLoad(), and while the socket is still CONNECTING
