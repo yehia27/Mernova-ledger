@@ -52,13 +52,23 @@ var UNDO_SYNC_TO_PAD = true;
 
 // How the remaining strokes are put back on the pad screen.
 //
-//   "direct" (default) - SET_TARGET(0) then SET_IMAGE straight onto the live
-//                        display, followed by the two labels. Four commands,
-//                        and the pixels we send are the pixels shown.
-//   "store"            - render into image store UNDO_STORE_ID, then blit it
-//                        with SET_IMAGE_FROM_STORE. Six commands. Use this if
-//                        the firmware refuses SET_IMAGE on the live display.
-var UNDO_REPAINT_MODE = "direct";
+//   "store" (default) - render into image store UNDO_STORE_ID, then blit it
+//                       onto the display with SET_IMAGE_FROM_STORE. This is
+//                       what the preparation sequence itself does, and the
+//                       blit is what actually makes anything appear: writes
+//                       to target 0 land in a back buffer that needs an
+//                       explicit present.
+//   "direct"          - SET_TARGET(0) then SET_IMAGE straight at the display.
+//                       Fewer commands, but only works if the firmware
+//                       presents display writes immediately.
+//
+// If the chosen mode fails, the other one is tried automatically; see
+// UNDO_REPAINT_FALLBACK.
+var UNDO_REPAINT_MODE = "store";
+
+// On a failed repaint, retry once with the other UNDO_REPAINT_MODE. The log
+// records which mode succeeded, so the default above can be set accordingly.
+var UNDO_REPAINT_FALLBACK = true;
 
 // Whether TOKEN_CMD_API_SIGNATURE_RETRY is sent at all.
 //
@@ -219,6 +229,8 @@ var undoSequenceIndex = -1;
 var undoCompositeImage = null;
 var undoTimeoutId = null;
 var undoResyncPending = false;
+var undoActiveMode = null;
+var undoTriedModes = [];
 
 var statusElement = null;
 var sigcanvas = null;
@@ -375,6 +387,11 @@ function getSelectedPenColor() {
 
 var logLineCount = 0;
 
+// Kept in memory as well as in #log, so signotecLog() works on a page that has
+// no #log element and survives the list being cleared.
+var logHistory = [];
+var LOG_HISTORY_LIMIT = 2000;
+
 function shortenForLog(msg) {
     try {
         // collapse the very large base64 image payloads
@@ -395,6 +412,11 @@ function logMessage(msg) {
     try {
         console.log("[signotec] " + line);
     } catch (e) { /* no console */ }
+
+    logHistory.push(line);
+    if (logHistory.length > LOG_HISTORY_LIMIT) {
+        logHistory.shift();
+    }
 
     try {
         var list = byId("log");
@@ -544,6 +566,16 @@ function connectToService() {
 }
 
 /**
+ * The whole log as one string, ready to copy out of the console:
+ *
+ *     copy(signotecLog())        // Chrome / Edge devtools
+ *     console.log(signotecLog())
+ */
+function signotecLog() {
+    return logHistory.join("\n");
+}
+
+/**
  * Dump of everything needed to diagnose a stalled session. Call
  * signotecDiagnostics() from the browser console.
  */
@@ -568,6 +600,9 @@ function signotecDiagnostics() {
         openState: openState,
         preparationState: preparationState,
         undoState: undoSync_stateName(undoState),
+        repaintMode: UNDO_REPAINT_MODE,
+        retryMode: UNDO_RETRY_MODE,
+        lastRepaintModeUsed: undoActiveMode,
         strokes: signatureStrokes.length,
         hotSpots: { cancel: cancelButton, retry: retryButton, confirm: confirmButton }
     };
@@ -787,10 +822,10 @@ function undo_last_stroke_send() {
     undoSync_start();
 }
 
-function undoSync_orderedStates() {
+function undoSync_orderedStates(mode) {
     var sequence;
 
-    if (UNDO_REPAINT_MODE === "store") {
+    if (mode === "store") {
         // render off-screen, then blit the finished store onto the display
         sequence = [
             undoStates.setStoreTarget,
@@ -902,12 +937,28 @@ function undoSync_start() {
         }
 
         undoCompositeImage = compositeBase64;
-        undoSequence = undoSync_orderedStates();
-        undoSequenceIndex = -1;
-        logMessage("-- undo sync start (repaint=" + UNDO_REPAINT_MODE +
-            ", retry=" + UNDO_RETRY_MODE + ")");
-        undoSync_advance();
+        undoTriedModes = [];
+        undoSync_run(UNDO_REPAINT_MODE);
     });
+}
+
+/** Runs the repaint with one particular UNDO_REPAINT_MODE. */
+function undoSync_run(mode) {
+    undoActiveMode = mode;
+    undoTriedModes.push(mode);
+
+    undoSequence = undoSync_orderedStates(mode);
+    undoSequenceIndex = -1;
+
+    logMessage("-- undo sync start (repaint=" + mode +
+        ", retry=" + UNDO_RETRY_MODE + ")");
+    undoSync_advance();
+}
+
+/** The repaint mode that has not been tried yet, or null. */
+function undoSync_otherMode() {
+    var other = (undoActiveMode === "store") ? "direct" : "store";
+    return (undoTriedModes.indexOf(other) === -1) ? other : null;
 }
 
 function undoSync_advance() {
@@ -915,7 +966,8 @@ function undoSync_advance() {
 
     undoSequenceIndex++;
     if (undoSequenceIndex >= undoSequence.length) {
-        logMessage("-- undo sync done: pad screen matches the preview");
+        logMessage("-- undo sync done with repaint mode '" + undoActiveMode +
+            "': pad screen matches the preview");
         undoSync_finish();
         return;
     }
@@ -956,7 +1008,7 @@ function undoSync_handleResponse(obj) {
         logResponseError("undo step " + undoSync_stateName(undoState) + " failed", obj);
         // Deliberately not close_pad(): keep signing alive and give up on the
         // screen repaint only.
-        undoSync_finish();
+        undoSync_failed();
         return true;
     }
 
@@ -968,6 +1020,23 @@ function undoSync_handleResponse(obj) {
 /** Ends the screen sync without touching the signing session. */
 function undoSync_abort(reason) {
     logMessage("!! undo sync aborted at " + undoSync_stateName(undoState) + ": " + reason);
+    undoSync_failed();
+}
+
+/**
+ * A repaint step failed. Try the other repaint mode once before giving up,
+ * so a firmware that refuses one route still gets its screen updated.
+ */
+function undoSync_failed() {
+    clearUndoTimeout();
+
+    var other = UNDO_REPAINT_FALLBACK ? undoSync_otherMode() : null;
+    if (other !== null && padState === padStates.opened && undoCompositeImage !== null) {
+        logMessage("-- repaint mode '" + undoActiveMode + "' failed, retrying with '" + other + "'");
+        undoSync_run(other);
+        return;
+    }
+
     undoSync_finish();
 }
 
@@ -978,6 +1047,8 @@ function undoSync_finish() {
     undoSequence = [];
     undoSequenceIndex = -1;
     undoCompositeImage = null;
+    undoActiveMode = null;
+    undoTriedModes = [];
 
     if (undoResyncPending) {
         undoResyncPending = false;

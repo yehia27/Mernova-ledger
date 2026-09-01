@@ -39,23 +39,33 @@ clear can land *after* our repaint and wipe it — which looks exactly like
 undone stroke, and this file never reads the firmware's stroke buffer, since
 the saved image comes from `sigCanvas`.
 
-The repaint (`UNDO_REPAINT_MODE = "direct"`, the default):
+The repaint (`UNDO_REPAINT_MODE = "store"`, the default):
 
 | step | command |
 |---|---|
-| 1 | `API_DISPLAY_SET_TARGET` → `0` (live display) |
+| 1 | `API_DISPLAY_SET_TARGET` → `1` (off-screen store) |
 | 2 | `API_DISPLAY_SET_IMAGE` — template + remaining strokes |
 | 3–4 | `API_DISPLAY_SET_TEXT_IN_RECT` ×2 — the two labels |
+| 5 | `API_DISPLAY_SET_TARGET` → `0` (live display) |
+| 6 | `API_DISPLAY_SET_IMAGE_FROM_STORE` → `1` |
 
-If a step fails or times out, the sync stops there and the session keeps
-going with the pad screen one stroke out of date.
+Step 6 is what actually makes anything appear. The preparation sequence ends
+the same way, which is the evidence that writes to target 0 land in a back
+buffer needing an explicit present. `UNDO_REPAINT_MODE = "direct"` skips the
+store and writes at target 0 in two commands; it only works if the firmware
+presents display writes immediately.
+
+If a step fails, the other mode is tried automatically
+(`UNDO_REPAINT_FALLBACK`), and the log records which one succeeded. If both
+fail, the session keeps going with the pad screen one stroke out of date.
 
 ## Tuning flags (top of the file)
 
 | flag | default | meaning |
 |---|---|---|
 | `UNDO_SYNC_TO_PAD` | `true` | `false` = local-only Undo, no device commands |
-| `UNDO_REPAINT_MODE` | `"direct"` | `"store"` renders into an image store and blits it, if the firmware refuses `SET_IMAGE` on the live display |
+| `UNDO_REPAINT_MODE` | `"store"` | `"direct"` writes at target 0 without the store blit |
+| `UNDO_REPAINT_FALLBACK` | `true` | on failure, try the other repaint mode once |
 | `UNDO_RETRY_MODE` | `"none"` | `"before"` or `"after"` to also send `SIGNATURE_RETRY` |
 | `UNDO_STORE_ID` | `1` | image store used by `"store"` mode |
 | `UNDO_TIMEOUT_MS` | `8000` | give up on a step if the pad does not answer |
@@ -124,14 +134,25 @@ page where `onMainWindowLoad()` never ran, or where `#sigCanvas` is created
 later inside a dialog, still works. Commands issued before the socket is open
 are queued and flushed on `onopen` rather than throwing `InvalidStateError`.
 
-## If Retry still erases everything
+## Getting the log out
 
-That is `SIGNATURE_RETRY` clearing the screen and the clear landing after the
-repaint. `UNDO_RETRY_MODE` is `"none"` by default precisely to avoid it — make
-sure you are on the current file and that the log shows
-`-- undo sync start (repaint=direct, retry=none)`.
+```js
+copy(signotecLog())     // Chrome / Edge devtools: puts the whole log on the clipboard
+signotecLog()           // or just read it
+signotecDiagnostics()   // connection, element lookups, pad type, state machines
+```
 
-If the screen instead does not change at all, the firmware is refusing
-`SET_IMAGE` on the live display. Set `UNDO_REPAINT_MODE = "store"` and send me
-the `#log` contents: every command and every
-`TOKEN_PARAM_RETURN_CODE` / `TOKEN_PARAM_ERROR_DESCRIPTION` is in there.
+`signotecLog()` returns every sent command, every response, and every
+`TOKEN_PARAM_RETURN_CODE` / `TOKEN_PARAM_ERROR_DESCRIPTION`, kept in memory
+independently of the `#log` element.
+
+The lines that matter for an Undo are:
+
+```
+-- undo: N stroke(s) left
+-- undo sync start (repaint=store, retry=none)
+-- undo step ... ok            (one per command)
+-- undo sync done with repaint mode 'store'
+```
+
+A `!!` line in between names the command that failed and why.

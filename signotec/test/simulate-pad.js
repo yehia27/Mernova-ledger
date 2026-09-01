@@ -140,8 +140,8 @@ async function fullSession() {
   sent = []; press(retryButton); await wait(400);
   check('one stroke removed',        peek().signatureStrokes.length === 2, 'got ' + peek().signatureStrokes.length);
   check('default sends no SIGNATURE_RETRY', !sent.includes('TOKEN_CMD_API_SIGNATURE_RETRY'), seq());
-  check('direct repaint: 4 commands', seq() === DIRECT_SEQ, seq());
-  check('direct repaint targets the live display', targetsSent().slice(-1) === '0', targetsSent());
+  check('default repaint goes through the store', seq() === STORE_SEQ, seq());
+  check('ends on the live display', targetsSent().slice(-1) === '0', targetsSent());
   check('preparation never re-entered',
         preparationState === prepState && !sent.includes('TOKEN_CMD_API_SENSOR_ADD_HOT_SPOT'), 'state moved');
   check('session still open',        deviceOpen && !sent.includes('TOKEN_CMD_API_DEVICE_CLOSE'), 'closed');
@@ -226,15 +226,38 @@ async function fullSession() {
   check('pad closed after a failed command', okOpen && !deviceOpen, 'deviceOpen=' + deviceOpen);
 
   clearTimeout(T);
+  section('UNDO_REPAINT_MODE = "direct"');
+  await fullSession();
+  strokeOf(5,100); strokeOf(5,200);
+  UNDO_REPAINT_MODE = 'direct';
+  sent = []; logLines = []; press(retryButton); await wait(400);
+  check('direct repaint: 4 commands', seq() === DIRECT_SEQ, seq());
+  check('targets the live display',   targetsSent().slice(-1) === '0', targetsSent());
+  UNDO_REPAINT_MODE = 'store';
+
   section('UNDO_REPAINT_MODE = "store"');
   await fullSession();
   strokeOf(5,100); strokeOf(5,200);
-  UNDO_REPAINT_MODE = 'store';
   sent = []; logLines = []; press(retryButton); await wait(400);
   check('store repaint: 6 commands',  seq() === STORE_SEQ, seq());
   check('renders to store 1 then display 0', targetsSent() === '10', targetsSent());
   check('one stroke removed',         peek().signatureStrokes.length === 1, 'got ' + peek().signatureStrokes.length);
-  UNDO_REPAINT_MODE = 'direct';
+
+  section('Automatic fallback to the other repaint mode');
+  strokeOf(5,600);
+  sent = []; logLines = []; failAt = 'TOKEN_CMD_API_DISPLAY_SET_IMAGE';
+  press(retryButton); await wait(600);
+  check('store failure falls back to direct',
+        logLines.some(l => l.includes("failed, retrying with 'direct'")), 'no fallback line');
+  check('fallback completed',
+        logLines.some(l => l.includes("done with repaint mode 'direct'")), 'did not finish');
+  check('session survives', deviceOpen && padState === padStates.opened, 'pad closed');
+  check('back to idle',     undoState === undoStates.idle, 'undoState=' + undoState);
+
+  section('signotecLog()');
+  check('returns the whole log as text',
+        typeof signotecLog() === 'string' && signotecLog().split('\n').length > 20,
+        'lines: ' + signotecLog().split('\n').length);
 
   section('UNDO_RETRY_MODE');
   for (const [mode, assertion] of [
