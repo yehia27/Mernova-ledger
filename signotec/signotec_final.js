@@ -495,8 +495,12 @@ function flushPendingMessages() {
  * Shared guard for every response handler: logs and closes the pad when the
  * pad reports a failure. Returns true when the caller should stop.
  */
+function returnCode(obj) {
+    return Number(obj.TOKEN_PARAM_RETURN_CODE);
+}
+
 function failed(obj, what) {
-    if (obj.TOKEN_PARAM_RETURN_CODE >= 0) {
+    if (returnCode(obj) >= 0) {
         return false;
     }
     logResponseError(what, obj);
@@ -746,18 +750,26 @@ function resetSignature() {
 }
 
 // TOKEN_CMD_SIGNATURE_POINT: one pen sample from the pad.
-// p === 0 marks the first point of a new stroke.
+//
+// A pressure of 0 marks the first point of a new stroke. The pad sends these
+// values as JSON strings, so they MUST be coerced before comparing: a strict
+// p === 0 never matches "0", every sample then lands in one single stroke,
+// the preview draws a connecting line between what should be separate
+// strokes, and Undo removes that one stroke, which is the whole signature.
 function signature_point_send(x, y, p) {
     if (sigcanvas === null) {
         return;
     }
 
-    if (p === 0 || currentStroke === null) {
+    var pressure = Number(p);
+
+    if (pressure === 0 || currentStroke === null) {
         currentStroke = { color: getSelectedPenColor(), points: [] };
         signatureStrokes.push(currentStroke);
+        logMessage("-- stroke " + signatureStrokes.length + " started");
     }
 
-    currentStroke.points.push({ x: x, y: y });
+    currentStroke.points.push({ x: Number(x), y: Number(y) });
     drawLastSegment(sigcanvas.getContext("2d"), currentStroke);
 }
 
@@ -1004,7 +1016,7 @@ function undoSync_handleResponse(obj) {
         return false;
     }
 
-    if (obj.TOKEN_PARAM_RETURN_CODE < 0) {
+    if (returnCode(obj) < 0) {
         logResponseError("undo step " + undoSync_stateName(undoState) + " failed", obj);
         // Deliberately not close_pad(): keep signing alive and give up on the
         // screen repaint only.
@@ -1013,6 +1025,7 @@ function undoSync_handleResponse(obj) {
     }
 
     logMessage("-- undo step " + undoSync_stateName(undoState) + " ok");
+
     undoSync_advance();
     return true;
 }
@@ -1207,7 +1220,7 @@ function onGetCountResponse(obj) {
     if (failed(obj, "the search for pads failed")) {
         return;
     }
-    if (obj.TOKEN_PARAM_RETURN_CODE === 0) {
+    if (returnCode(obj) === 0) {
         logMessage("!! no connected pads have been found");
         resetPipelineState();
         return;
@@ -1235,7 +1248,7 @@ function onGetInfoResponse(obj) {
         return;
     }
 
-    supportsRSA = (obj.TOKEN_PARAM_CAPABILITIES & deviceCapabilities.SupportsRSA) !== 0;
+    supportsRSA = (Number(obj.TOKEN_PARAM_CAPABILITIES) & deviceCapabilities.SupportsRSA) !== 0;
     setText("RSASupport_0", supportsRSA ? "Yes" : "No");
     setText("PadType_0", getReadableType(padType));
     setText("SerialNumber_0", obj.TOKEN_PARAM_SERIAL);
@@ -1334,7 +1347,7 @@ function api_device_open() {
 }
 
 function onDeviceOpenResponse(obj) {
-    if (obj.TOKEN_PARAM_RETURN_CODE < 0) {
+    if (returnCode(obj) < 0) {
         // The pad is not open, so close_pad() would be wrong here.
         logResponseError("failed to open the pad", obj);
         resetPipelineState();
@@ -1359,7 +1372,7 @@ function onGetDisplayWidthResponse(obj) {
     if (failed(obj, "failed to get the display width")) {
         return;
     }
-    sigcanvas.width = obj.TOKEN_PARAM_RETURN_CODE;
+    sigcanvas.width = returnCode(obj);
 
     openState = openStates.getDisplayHeight;
     api_device_open();
@@ -1369,7 +1382,7 @@ function onGetDisplayHeightResponse(obj) {
     if (failed(obj, "failed to get the display height")) {
         return;
     }
-    sigcanvas.height = obj.TOKEN_PARAM_RETURN_CODE;
+    sigcanvas.height = returnCode(obj);
 
     openState = openStates.getResolution;
     api_device_open();
@@ -1381,8 +1394,8 @@ function onGetResolutionResponse(obj) {
     }
 
     // signature coordinates -> display pixels
-    scaleFactorX = sigcanvas.width / obj.TOKEN_PARAM_PAD_X_RESOLUTION;
-    scaleFactorY = sigcanvas.height / obj.TOKEN_PARAM_PAD_Y_RESOLUTION;
+    scaleFactorX = sigcanvas.width / Number(obj.TOKEN_PARAM_PAD_X_RESOLUTION);
+    scaleFactorY = sigcanvas.height / Number(obj.TOKEN_PARAM_PAD_Y_RESOLUTION);
 
     openState = openStates.openPad;
     api_signature_start();
@@ -1542,7 +1555,7 @@ function onAddHotSpotResponse(obj) {
         return;
     }
 
-    var id = obj.TOKEN_PARAM_RETURN_CODE;
+    var id = Number(obj.TOKEN_PARAM_RETURN_CODE);
 
     switch (preparationState) {
         case preparationStates.setCancelButton:
@@ -1619,7 +1632,10 @@ function onSignatureStartResponse(obj) {
 // Pad buttons
 // ---------------------------------------------------------------------------
 
-function api_sensor_hot_spot_pressed_send(button) {
+function api_sensor_hot_spot_pressed_send(rawButton) {
+    // ids come back as JSON strings; a switch compares strictly
+    var button = Number(rawButton);
+
     switch (button) {
         case cancelButton:
             signature_cancel_send();
@@ -1635,7 +1651,9 @@ function api_sensor_hot_spot_pressed_send(button) {
             break;
 
         default:
-            logMessage("!! unknown hot spot id " + button);
+            logMessage("!! unknown hot spot id " + button +
+                " (cancel=" + cancelButton + ", retry=" + retryButton +
+                ", confirm=" + confirmButton + ")");
     }
 }
 
@@ -1738,7 +1756,7 @@ function close_pad() {
 function onDeviceCloseResponse(obj) {
     resetPipelineState();
 
-    if (obj.TOKEN_PARAM_RETURN_CODE < 0) {
+    if (returnCode(obj) < 0) {
         logResponseError("failed to close the pad", obj);
     }
 

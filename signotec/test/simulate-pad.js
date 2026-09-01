@@ -13,6 +13,11 @@ const PATH = require('path').join(__dirname, '..', 'signotec_final.js');
 
 let sent = [], deviceOpen = false, failAt = null, dropReplyFor = null;
 let hideCanvas = false;
+
+// The real pad sends every numeric field as a JSON string. Run the suite both
+// ways: PROTO=string (the default, matching hardware) and PROTO=number.
+const AS_STRING = (process.env.PROTO || 'string') === 'string';
+const num = (v) => (AS_STRING ? String(v) : v);
 const elements = {};
 const el = (id, extra) => (elements[id] ||= Object.assign({
   id, value: '', src: id + '.png', checked: false, disabled: false,
@@ -64,25 +69,25 @@ const peek = () => __peek();
 
 const reply = (origin, extra) => onMessage({ data: JSON.stringify(
   Object.assign({ TOKEN_TYPE:'TOKEN_TYPE_RESPONSE', TOKEN_CMD_ORIGIN:origin,
-                  TOKEN_PARAM_RETURN_CODE:0 }, extra || {})) });
+                  TOKEN_PARAM_RETURN_CODE:num(0) }, extra || {})) });
 
 let hotspotId = 0;
 function respond(o) {
   const c = o.TOKEN_CMD;
   if (dropReplyFor === c) { dropReplyFor = null; return; }          // simulate a lost reply
   if (failAt === c) { failAt = null;
-    return reply(c, { TOKEN_PARAM_RETURN_CODE:-42, TOKEN_PARAM_ERROR_DESCRIPTION:'simulated failure' }); }
+    return reply(c, { TOKEN_PARAM_RETURN_CODE:num(-42), TOKEN_PARAM_ERROR_DESCRIPTION:'simulated failure' }); }
   switch (c) {
-    case 'TOKEN_CMD_API_DEVICE_GET_COUNT':   return reply(c, { TOKEN_PARAM_RETURN_CODE:1 });
+    case 'TOKEN_CMD_API_DEVICE_GET_COUNT':   return reply(c, { TOKEN_PARAM_RETURN_CODE:num(1) });
     case 'TOKEN_CMD_API_DEVICE_GET_INFO':    return reply(c, { TOKEN_PARAM_TYPE:'11', TOKEN_PARAM_SERIAL:'SN-1',
-                                                               TOKEN_PARAM_CAPABILITIES:0x40 });
+                                                               TOKEN_PARAM_CAPABILITIES:num(0x40) });
     case 'TOKEN_CMD_API_DEVICE_GET_VERSION': return reply(c, { TOKEN_PARAM_VERSION:'2.3.1' });
     case 'TOKEN_CMD_API_DEVICE_OPEN':        deviceOpen = true; return reply(c);
-    case 'TOKEN_CMD_API_DISPLAY_GET_WIDTH':  return reply(c, { TOKEN_PARAM_RETURN_CODE:640 });
-    case 'TOKEN_CMD_API_DISPLAY_GET_HEIGHT': return reply(c, { TOKEN_PARAM_RETURN_CODE:480 });
+    case 'TOKEN_CMD_API_DISPLAY_GET_WIDTH':  return reply(c, { TOKEN_PARAM_RETURN_CODE:num(640) });
+    case 'TOKEN_CMD_API_DISPLAY_GET_HEIGHT': return reply(c, { TOKEN_PARAM_RETURN_CODE:num(480) });
     case 'TOKEN_CMD_API_SIGNATURE_GET_RESOLUTION':
-      return reply(c, { TOKEN_PARAM_PAD_X_RESOLUTION:2540, TOKEN_PARAM_PAD_Y_RESOLUTION:2540 });
-    case 'TOKEN_CMD_API_SENSOR_ADD_HOT_SPOT': return reply(c, { TOKEN_PARAM_RETURN_CODE:hotspotId++ });
+      return reply(c, { TOKEN_PARAM_PAD_X_RESOLUTION:num(2540), TOKEN_PARAM_PAD_Y_RESOLUTION:num(2540) });
+    case 'TOKEN_CMD_API_SENSOR_ADD_HOT_SPOT': return reply(c, { TOKEN_PARAM_RETURN_CODE:num(hotspotId++) });
     case 'TOKEN_CMD_API_DEVICE_CLOSE':       deviceOpen = false; return reply(c);
     default: return reply(c);
   }
@@ -90,10 +95,10 @@ function respond(o) {
 
 const wait  = (ms=80) => new Promise(r => setTimeout(r, ms));
 const point = (x,y,p) => onMessage({ data: JSON.stringify({ TOKEN_TYPE:'TOKEN_TYPE_SEND',
-  TOKEN_CMD:'TOKEN_CMD_SIGNATURE_POINT', TOKEN_PARAM_POINT:{x,y,p} }) });
+  TOKEN_CMD:'TOKEN_CMD_SIGNATURE_POINT', TOKEN_PARAM_POINT:{ x:num(x), y:num(y), p:num(p) } }) });
 const strokeOf = (n, base) => { for (let i=0;i<n;i++) point(base+i, base+i, i===0?0:100); };
 const press = (id) => onMessage({ data: JSON.stringify({ TOKEN_TYPE:'TOKEN_TYPE_SEND',
-  TOKEN_CMD:'TOKEN_CMD_API_SENSOR_HOT_SPOT_PRESSED', TOKEN_PARAM_HOTSPOT_ID:id }) });
+  TOKEN_CMD:'TOKEN_CMD_API_SENSOR_HOT_SPOT_PRESSED', TOKEN_PARAM_HOTSPOT_ID:num(id) }) });
 
 let fails = 0, group = '';
 const section = (t) => { group = t; realLog('\n\x1b[1m' + t + '\x1b[0m'); };
@@ -123,6 +128,8 @@ async function fullSession() {
 
 (async () => {
   const T = setTimeout(() => { realLog('\n\x1b[31mHUNG\x1b[0m in section: ' + group); process.exit(2); }, 45000);
+  realLog('\x1b[1m\nProtocol values sent as ' + (AS_STRING ? 'STRINGS (as the pad does)' : 'numbers') + '\x1b[0m');
+
   section('Preparation');
   await fullSession();
   check('pad opened',            deviceOpen && padState === padStates.opened, 'padState=' + padState);
@@ -136,7 +143,14 @@ async function fullSession() {
 
   section('Undo removes one stroke and repaints the pad');
   strokeOf(5,100); strokeOf(5,200); strokeOf(5,300);
-  check('3 strokes captured', peek().signatureStrokes.length === 3, 'got ' + peek().signatureStrokes.length);
+  check('3 strokes captured, not merged into one',
+        peek().signatureStrokes.length === 3, 'got ' + peek().signatureStrokes.length);
+  check('each stroke kept its own points',
+        peek().signatureStrokes.every(s => s.points.length === 5),
+        peek().signatureStrokes.map(s => s.points.length).join('/'));
+  check('coordinates stored as numbers',
+        peek().signatureStrokes.every(s => s.points.every(pt =>
+          typeof pt.x === 'number' && typeof pt.y === 'number')), 'not numeric');
   sent = []; press(retryButton); await wait(400);
   check('one stroke removed',        peek().signatureStrokes.length === 2, 'got ' + peek().signatureStrokes.length);
   check('default sends no SIGNATURE_RETRY', !sent.includes('TOKEN_CMD_API_SIGNATURE_RETRY'), seq());

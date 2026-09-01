@@ -82,6 +82,30 @@ console, and every error reports its `TOKEN_PARAM_RETURN_CODE` and
 
 Prefixes: `>>` sent, `<<` received, `--` progress, `!!` error.
 
+## The pad sends numbers as strings
+
+Every numeric field in the protocol — `TOKEN_PARAM_RETURN_CODE`, the point's
+`x` / `y` / `p`, `TOKEN_PARAM_HOTSPOT_ID`, the resolutions — arrives as a JSON
+**string**. The vendor code compared loosely (`p == 0`), which hid this.
+
+Tightening one of those to `p === 0` during a cleanup broke stroke detection:
+`"0" === 0` is false, so no sample was ever recognised as the start of a new
+stroke, every point landed in one single stroke, the preview drew a connecting
+line between strokes that should be separate, and Undo removed that one stroke
+— the entire signature.
+
+Every numeric field is now coerced with `Number()` before it is compared,
+including the hot spot ids, which a `switch` compares strictly.
+
+`test/simulate-pad.js` runs the whole suite twice, `PROTO=string` (the
+default, matching hardware) and `PROTO=number`, so this class of bug cannot
+come back:
+
+```
+node test/simulate-pad.js
+PROTO=number node test/simulate-pad.js
+```
+
 ## Bugs fixed along the way
 
 - `padMode` was stuck on `Default` because the mode selector was never
