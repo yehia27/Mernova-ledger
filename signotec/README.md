@@ -180,3 +180,29 @@ The lines that matter for an Undo are:
 ```
 
 A `!!` line in between names the command that failed and why.
+
+## Verifying the pad image
+
+`test/simulate-pad.js` checks the command sequence. `test/verify-pad-image.js`
+checks the pixels: it runs `signotec_final.js` in a real headless Chromium with
+a real canvas, draws three strokes in three separate bands of the signature
+area, presses the Retry hot spot, captures the base64 PNG the code puts in
+`TOKEN_PARAM_BITMAP`, and counts the ink in each band.
+
+```
+node test/verify-pad-image.js
+```
+
+```
+  bare template:  484  |  484  |  484
+  three strokes:  2176  |  2176  |  2176
+  after undo:     2176  |  2176  |  484
+```
+
+Band 3 returns to exactly the bare template's ink count — the last stroke is
+gone and nothing else changed. The captured images are written to
+`test/output/pad-before-undo.png` and `pad-after-undo.png`.
+
+This proves the image is correct. It does not prove the firmware accepts it;
+only hardware can show that, and `signotecLog()` reports the pad's answer to
+each command.

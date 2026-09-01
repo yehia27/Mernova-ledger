@@ -208,6 +208,12 @@ var buttonLeft = 0;
 // without the "data:image/png;base64," prefix. Undo always composites onto
 // this original, never onto a previous composite, so nothing accumulates.
 var backgroundImage = null;
+var backgroundImageWidth = 0;
+var backgroundImageHeight = 0;
+
+// Whether the pad has a colour display. Unknown counts as colour, so a pad
+// that does not report its capabilities keeps the selected pen colour.
+var hasColorDisplay = true;
 
 // pad display <-> signature coordinate scaling
 var scaleFactorX = 1.0;
@@ -659,17 +665,19 @@ function onError(evt) {
  * Draws one stroke as a single path. Called for the preview redraw and for
  * the composite pushed back to the pad.
  */
-function drawStroke(ctx, stroke, penWidth) {
+function drawStroke(ctx, stroke, penWidth, colorOverride) {
     var points = stroke.points;
     if (!points || points.length === 0) {
         return;
     }
 
+    var color = colorOverride || stroke.color;
+
     ctx.lineWidth = penWidth;
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
-    ctx.strokeStyle = stroke.color;
-    ctx.fillStyle = stroke.color;
+    ctx.strokeStyle = color;
+    ctx.fillStyle = color;
 
     var firstX = points[0].x * scaleFactorX;
     var firstY = points[0].y * scaleFactorY;
@@ -690,9 +698,9 @@ function drawStroke(ctx, stroke, penWidth) {
     ctx.stroke();
 }
 
-function drawStrokes(ctx, penWidth) {
+function drawStrokes(ctx, penWidth, colorOverride) {
     for (var i = 0; i < signatureStrokes.length; i++) {
-        drawStroke(ctx, signatureStrokes[i], penWidth);
+        drawStroke(ctx, signatureStrokes[i], penWidth, colorOverride);
     }
 }
 
@@ -1091,11 +1099,23 @@ function buildCompositeImage(callback) {
             offscreen.height = sigcanvas.height;
 
             var ctx = offscreen.getContext("2d");
-            ctx.drawImage(template, 0, 0, offscreen.width, offscreen.height);
+
+            // Drawn at 0,0 at its own size, exactly like the
+            // TOKEN_PARAM_X_POS/Y_POS 0,0 SET_IMAGE the preparation sequence
+            // sends. Scaling it here instead would shift the border and the
+            // button graphics relative to what the pad is already showing.
+            ctx.drawImage(template, 0, 0);
+
+            if (template.width !== offscreen.width || template.height !== offscreen.height) {
+                logMessage("!! template is " + template.width + "x" + template.height +
+                    " but the display is " + offscreen.width + "x" + offscreen.height);
+            }
 
             // PAD_PEN_WIDTH so the repainted strokes match the width the
-            // firmware itself drew with (TOKEN_CMD_API_DISPLAY_CONFIG_PEN)
-            drawStrokes(ctx, PAD_PEN_WIDTH);
+            // firmware itself drew with (TOKEN_CMD_API_DISPLAY_CONFIG_PEN).
+            // On a monochrome pad the firmware drew in black, so the repaint
+            // uses black too instead of the preview's pen colour.
+            drawStrokes(ctx, PAD_PEN_WIDTH, hasColorDisplay ? null : "#000000");
 
             var dataURL = offscreen.toDataURL("image/png");
             callback(stripDataUrlPrefix(dataURL));
@@ -1248,7 +1268,16 @@ function onGetInfoResponse(obj) {
         return;
     }
 
-    supportsRSA = (Number(obj.TOKEN_PARAM_CAPABILITIES) & deviceCapabilities.SupportsRSA) !== 0;
+    var capabilities = Number(obj.TOKEN_PARAM_CAPABILITIES);
+    if (isNaN(capabilities)) {
+        // the pad did not report them; assume the more permissive defaults
+        supportsRSA = false;
+        hasColorDisplay = true;
+    } else {
+        supportsRSA = (capabilities & deviceCapabilities.SupportsRSA) !== 0;
+        hasColorDisplay = (capabilities & deviceCapabilities.HasColorDisplay) !== 0;
+        logMessage("-- display is " + (hasColorDisplay ? "colour" : "monochrome"));
+    }
     setText("RSASupport_0", supportsRSA ? "Yes" : "No");
     setText("PadType_0", getReadableType(padType));
     setText("SerialNumber_0", obj.TOKEN_PARAM_SERIAL);
@@ -1293,7 +1322,11 @@ function loadBackgroundImage(imageId) {
             canvas.getContext("2d").drawImage(this, 0, 0);
 
             backgroundImage = stripDataUrlPrefix(canvas.toDataURL("image/png"));
-            logMessage("-- background template '" + imageId + "' loaded");
+            backgroundImageWidth = canvas.width;
+            backgroundImageHeight = canvas.height;
+
+            logMessage("-- background template '" + imageId + "' loaded (" +
+                canvas.width + "x" + canvas.height + ")");
         } catch (e) {
             logMessage("!! background template '" + imageId + "' failed: " + e);
         }
